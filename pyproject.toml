@@ -1,0 +1,10 @@
+[project]
+name = "mneme-memory"
+version = "0.1.0"
+description = "File-canon, proof-coupled memory layer for AI agents. One file, stdlib only."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+mneme = "mneme:_cli"
