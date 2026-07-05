@@ -140,9 +140,9 @@ def test_apply_outcome_is_idempotent_per_run(tmp_path):
     mem.add_note("lesson", "Trusted lesson", "x")
     key = mem.retrieve("trusted lesson")[0]["key"]
     mem.record_served("run7", [key], "index")
-    assert mem.apply_outcome("run7", "done") == 1
-    assert mem.apply_outcome("run7", "done") == 0          # repeat is a no-op
-    assert mem.apply_outcome("run7", "rolled_back") == 0   # even with a different status
+    assert mem.apply_outcome("run7", "done", used_keys=[key]) == 1
+    assert mem.apply_outcome("run7", "done", used_keys=[key]) == 0        # repeat is a no-op
+    assert mem.apply_outcome("run7", "rolled_back", used_keys=[key]) == 0  # even w/ new status
     # trust moved exactly once: 0.5 -> 0.667, not further
     assert abs(mem.retrieve("trusted lesson")[0]["trust"] - (2 / 3)) < 1e-9
 

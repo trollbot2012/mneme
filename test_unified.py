@@ -21,7 +21,8 @@ def test_record_served_then_outcome_moves_trust(tmp_path):
     m.remember("Route probe before trusting a provider", "health != working")
     key = m.recall("route probe")[0]["key"]
     m.record_served("run1", [key], "index")
-    assert m.record_outcome("run1", "done") == 1
+    # used_keys carries the full-strength signal: the memory was consulted
+    assert m.record_outcome("run1", "done", used_keys=[key]) == 1
     # 0.5 -> 0.667 on one positive, exactly as the formula predicts
     assert abs(m.recall("route probe")[0]["trust"] - (2 / 3)) < 1e-9
 
@@ -32,7 +33,7 @@ def test_audit_reports_graveyard_and_trust(tmp_path):
     m.remember("Never served note", "y")
     key = m.recall("served note")[0]["key"]
     m.record_served("r", [key], "index")
-    m.record_outcome("r", "done")
+    m.record_outcome("r", "done", used_keys=[key])
     a = m.audit()
     assert a["rows"] == 2 and 0.0 <= a["graveyard_ratio"] <= 1.0
     assert a["trust_evaluated"] == 1 and a["trust_mean"] is not None

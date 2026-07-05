@@ -159,7 +159,8 @@ def test_trust_sinks_serially_failing_memory(tmp_path):
     for i in range(3):
         run = f"run{i}"
         mem.record_served(run, [key2], "index")
-        assert mem.apply_outcome(run, "rolled_back") == 1
+        # used_keys: the agent actually followed this lesson into the failure
+        assert mem.apply_outcome(run, "rolled_back", used_keys=[key2]) == 1
     hits = mem.retrieve("alpha rule")
     assert "one" in hits[0]["title"]  # untouched note (trust 0.5) outranks 0.2
     assert hits[-1]["trust"] == pytest.approx((0 + 1) / (3 + 2))
