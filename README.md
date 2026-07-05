@@ -57,6 +57,27 @@ your-agent/
 - **Lifecycle**: episodes auto-compact to an archive db past a cap. Quarantine
   hides a bad memory everywhere without touching your file.
 
+## One layer, one interface
+
+Mneme is the sole memory layer — research sources (Holographic, Hindsight,
+Honcho, MEMORY.md, and Mneme's own lineage) are folded into ONE engine, not
+routed between. The agent-facing API:
+
+| verb | what it does |
+|---|---|
+| `remember(title, body, kind=..., project=...)` | durable write (lesson/fact/preference) |
+| `recall(query, project)` | ranked retrieval, sub-ms, lexical + trust |
+| `record_served(run_id, keys, tier)` | meter what entered context |
+| `record_outcome(run_id, status)` | proof-coupled trust: proven outcomes move rank |
+| `summarize_user_model(project)` | deterministic operator model from preferences |
+| `export_memory(path)` / `import_memory(snapshot)` | readable MEMORY.md-style snapshot, round-trips |
+| `compact()` | archive episode overflow — never silent deletion |
+| `audit()` | store health: graveyard ratio, trust distribution |
+| `explain_recall(query)` | WHY each hit ranked: lexical/jaccard/trust/decay components |
+
+`index_block(project, task_text, run_id)` remains the host-integration hook —
+the guaranteed read path injected at every task start.
+
 ## Wire it into any agent — three calls
 
 ```python

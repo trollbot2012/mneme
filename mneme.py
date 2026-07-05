@@ -213,6 +213,7 @@ _SECTION_HEADERS = {
 }
 _LINE_CAP = 220
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+_NL = chr(10)
 
 DEFAULTS = {
     "index_budget_chars": 4000,
@@ -270,6 +271,7 @@ class Mneme:
         cfg.update({k: v for k, v in (config or {}).items() if k in DEFAULTS})
         self.cfg = cfg
         self._bank_cache: dict[str, str] = {}
+        self._cooc = None  # lazy co-occurrence expansion table
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._lock = threading.Lock()
@@ -361,6 +363,7 @@ class Mneme:
                        file_mtime: float | None, valid_at: float) -> None:
         now = time.time()
         old = self._conn.execute("SELECT id, created_at FROM mem WHERE dedupe_key=?", (key,)).fetchone()
+        self._invalidate_cooc()
         mem_id = old[0] if old else uuid.uuid4().hex[:12]
         created = old[1] if old else now
         self._conn.execute("DELETE FROM mem WHERE dedupe_key=?", (key,))
@@ -376,7 +379,11 @@ class Mneme:
                 "INSERT INTO mem_fts (dedupe_key, title, body, keywords, tags) VALUES (?,?,?,?,?)",
                 (key, title, body, keywords, tags))
 
+    def _invalidate_cooc(self) -> None:
+        self._cooc = None
+
     def _delete_locked(self, key: str) -> None:
+        self._invalidate_cooc()
         self._conn.execute("DELETE FROM mem WHERE dedupe_key=?", (key,))
         if self.fts_available:
             self._conn.execute("DELETE FROM mem_fts WHERE dedupe_key=?", (key,))
@@ -450,6 +457,39 @@ class Mneme:
             f" WHERE dedupe_key IN ({qs})", keys).fetchall()
         return {r[0]: r for r in rows}
 
+    def _cooccurrence(self, topn: int = 3) -> dict:
+        """Deterministic query expansion table (the stdlib stand-in for
+        semantic depth): for each term, the terms that most often co-occur
+        with it across live rows. Built lazily, invalidated by writes.
+        Mechanism selected by the scale bake-off: bm25+expand was the only
+        variant that held precision@3 at 1000 entries, at the lowest latency."""
+        if self._cooc is not None:
+            return self._cooc
+        from collections import Counter
+        rows = self._conn.execute(
+            "SELECT title, keywords, tags, substr(body, 1, 400) FROM mem"
+            " WHERE invalid_at IS NULL").fetchall()
+        co: dict = {}
+        for parts in rows:
+            terms = set(_tokens(" ".join(x or "" for x in parts), cap=40))
+            for a in terms:
+                c = co.setdefault(a, Counter())
+                for b in terms:
+                    if a != b:
+                        c[b] += 1
+        self._cooc = {a: [w for w, _ in c.most_common(topn)] for a, c in co.items()}
+        return self._cooc
+
+    def _expand_tokens(self, toks: list) -> list:
+        try:
+            co = self._cooccurrence()
+        except Exception:
+            return toks
+        out = list(toks)
+        for t in toks:
+            out += co.get(t, [])
+        return list(dict.fromkeys(out))[:48]
+
     def _candidates(self, query: str, banks: tuple, limit: int = 64) -> list[dict]:
         """Lexical candidates: FTS5/BM25 (porter-stemmed) when available, else
         LIKE token matching. Returns rows with a normalized lexical score."""
@@ -464,6 +504,19 @@ class Mneme:
                 f" FROM mem_fts JOIN mem m ON m.dedupe_key = mem_fts.dedupe_key"
                 f" WHERE mem_fts MATCH ? AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
                 f" ORDER BY r LIMIT ?", (match, *banks, limit)).fetchall()
+            if not rows:
+                # Empty-result rescue (bake-off verdict): co-occurrence expansion
+                # dilutes ranked results on the hot path, but when the strict
+                # query finds NOTHING a wider net can only help.
+                wide = self._expand_tokens(toks)
+                if len(wide) > len(toks):
+                    match = " OR ".join(f'"{t}"' for t in wide)
+                    rows = self._conn.execute(
+                        f"SELECT m.dedupe_key, m.kind, m.bank, m.title, m.body, m.keywords, m.tags,"
+                        f" m.pinned, m.valid_at, bm25(mem_fts) AS r"
+                        f" FROM mem_fts JOIN mem m ON m.dedupe_key = mem_fts.dedupe_key"
+                        f" WHERE mem_fts MATCH ? AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
+                        f" ORDER BY r LIMIT ?", (match, *banks, limit)).fetchall()
         elif toks:
             like = " OR ".join(["title LIKE ? OR body LIKE ? OR keywords LIKE ? OR tags LIKE ?"] * min(len(toks), 8))
             params: list = []
@@ -772,6 +825,148 @@ class Mneme:
             if n.supersedes:
                 self._supersede_locked(key, n.supersedes)
             self._conn.commit()
+
+    # === Unified agent-facing API =========================================
+    # One layer, one interface. The verbs below are what an agent calls; the
+    # methods above are the engine. Research sources (Mneme/Holographic/
+    # Hindsight/Honcho/MEMORY.md) are folded in here, not routed between.
+
+    def remember(self, title, body="", *, kind="lesson", keywords="", tags="",
+                 pinned=False, supersedes="", project=None):
+        """Durable write. kind in lesson|fact|preference. Returns the note path."""
+        return self.add_note(kind, title, body, keywords=keywords, tags=tags,
+                             pinned=pinned, supersedes=supersedes, repo=project)
+
+    def record_outcome(self, run_id, status):
+        """Close a run: credit/debit proof-coupled trust for served memories.
+        status: done | rolled_back | failed_verification | (neutral otherwise)."""
+        return self.apply_outcome(run_id, status)
+
+    def audit(self):
+        """Whole-store health: counts, served-vs-never (graveyard detector),
+        trust distribution, quarantine, fts mode."""
+        s = self.stats()
+        with self._lock:
+            dist = self._conn.execute(
+                "SELECT positive, negative FROM mem_stats WHERE positive+negative > 0").fetchall()
+        trusts = [(pos + 1) / (pos + neg + 2) for pos, neg in dist]
+        s["trust_evaluated"] = len(trusts)
+        s["trust_mean"] = round(sum(trusts) / len(trusts), 3) if trusts else None
+        s["graveyard_ratio"] = round(s["never_served"] / s["rows"], 3) if s["rows"] else 0.0
+        return s
+
+    def explain_recall(self, query, project=None, top_k=5):
+        """Every hit with its score COMPONENTS (lexical, jaccard, trust, decay)
+        so an operator can see WHY a memory ranked where it did."""
+        banks = ("global",) if project is None else ("global", self.bank_of(project))
+        q = (query + " " + self._repo_hint(project)).strip()
+        with self._lock:
+            cands = self._candidates(q, banks, limit=max(32, top_k * 6))
+            stats = self._stats_map([c["key"] for c in cands])
+        qg = _trigrams(q)
+        out = []
+        for c in cands:
+            srow = stats.get(c["key"])
+            if srow is not None and srow[4]:
+                continue
+            trust = self._trust((srow[1], srow[2], srow[3]) if srow else None)
+            jacc = _jaccard(qg, _trigrams(c["title"] + " " + c["keywords"] + " " + c["tags"]))
+            decay = self._decay(c["kind"], c["valid_at"])
+            out.append({"title": c["title"], "kind": c["kind"],
+                        "lexical": round(c["lex"], 3), "jaccard": round(jacc, 3),
+                        "trust": round(trust, 3), "decay": round(decay, 3),
+                        "score": round((0.65 * c["lex"] + 0.35 * jacc) * trust * decay, 4)})
+        out.sort(key=lambda x: -x["score"])
+        return out[:top_k]
+
+    def summarize_user_model(self, project=None):
+        """Honcho-style user model, deterministic (no cloud, no LLM in the core
+        path): synthesize preference notes into one readable block. A dialectic
+        LLM pass is an optional host layer, never the core dependency."""
+        banks = ("global",) if project is None else ("global", self.bank_of(project))
+        qs = ",".join("?" * len(banks))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT title, body FROM mem WHERE kind='preference' AND invalid_at IS NULL "
+                "AND bank IN (" + qs + ") ORDER BY pinned DESC, valid_at DESC", banks).fetchall()
+        if not rows:
+            return ""
+        lines = ["Operator model (from stated preferences):"]
+        for title, body in rows[:30]:
+            first = (body or "").strip().partition(_NL)[0].strip()
+            line = "- " + title.strip()
+            if first and first.lower() != title.strip().lower():
+                line += " — " + first
+            lines.append(line[:220])
+        return _NL.join(lines)
+
+    def export_memory(self, path=None):
+        """MEMORY.md-style portable snapshot: all live notes as ONE readable
+        markdown doc (kind-sectioned). Importable back via import_memory()."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kind, bank, title, body, keywords, tags, pinned FROM mem "
+                "WHERE invalid_at IS NULL AND kind != 'episode' ORDER BY kind, bank, title").fetchall()
+        parts = ["# Mneme memory export", ""]
+        cur = None
+        for kind, bank, title, body, kw, tags, pinned in rows:
+            if kind != cur:
+                parts += ["", "## " + kind + "s", ""]
+                cur = kind
+            meta = []
+            if bank != "global":
+                meta.append("bank=" + bank)
+            if kw:
+                meta.append("keywords=" + kw)
+            if tags:
+                meta.append("tags=" + tags)
+            if pinned:
+                meta.append("pinned")
+            head = "### " + title
+            if meta:
+                head += "  <!-- " + "; ".join(meta) + " -->"
+            parts.append(head)
+            if body.strip():
+                parts += [body.strip(), ""]
+        text = _NL.join(parts) + _NL
+        if path:
+            Path(path).write_text(text, encoding="utf-8")
+        return text
+
+    def import_memory(self, path_or_text, project=None):
+        """Parse an export_memory() snapshot back into notes. ADD-only: existing
+        slugs untouched. Returns count written."""
+        import re as _re
+        raw = path_or_text
+        cand = Path(path_or_text) if len(path_or_text) < 400 else None
+        if cand is not None and cand.exists():
+            raw = cand.read_text(encoding="utf-8")
+        state = {"kind": "lesson", "written": 0, "title": None, "buf": []}
+
+        def flush():
+            if state["title"]:
+                body = _NL.join(state["buf"]).strip()
+                try:
+                    if self.add_note(state["kind"], state["title"], body, tags="imported",
+                                     repo=project, overwrite=False) is not None:
+                        state["written"] += 1
+                except ValueError:
+                    pass
+            state["title"], state["buf"] = None, []
+
+        for line in raw.splitlines():
+            if line.startswith("## ") and not line.startswith("### "):
+                flush()
+                k = line[3:].strip().lower().rstrip("s")
+                state["kind"] = k if k in ("lesson", "fact", "preference") else "lesson"
+            elif line.startswith("### "):
+                flush()
+                state["title"] = _re.sub(r"\s*<!--.*?-->\s*", "", line[4:]).strip()
+            elif state["title"] is not None:
+                state["buf"].append(line)
+        flush()
+        return state["written"]
+
 
 # ---------------------------------------------------------------------------
 # CLI: python mneme.py <cmd> [...] — MNEME_DIR env or --dir sets the home.
