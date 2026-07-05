@@ -73,11 +73,14 @@ def _parse_valid_at(raw: str, fallback: float) -> float:
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return time.mktime(time.strptime(raw, fmt))
-        except ValueError:
+        except (ValueError, OverflowError, OSError):
+            # mktime overflows on far-future dates and raises OSError on
+            # pre-1970 dates on Windows — a bad frontmatter date must never
+            # crash the whole reindex (audit C: OverflowError escape).
             continue
     try:
         return float(raw)
-    except ValueError:
+    except (ValueError, OverflowError):
         return fallback
 
 
@@ -151,6 +154,7 @@ def render_note(kind: str, title: str, body: str, *, keywords: str = "", tags: s
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -159,6 +163,22 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def _norm_path(path: Path) -> str:
+    """Canonical posix string for a path. Case-fold ONLY on Windows — POSIX
+    filesystems are case-sensitive, so lowercasing there collides distinct
+    files (audit: Foo.md vs foo.md). _file_key and reindex-prune share this."""
+    p = path.resolve().as_posix()
+    return p.lower() if os.name == "nt" else p
+
+
+def _like_escape(s: str) -> str:
+    r"""Escape SQL LIKE metacharacters so filesystem paths/slugs match
+    literally. `_` and `%` in a path (common in usernames/repo names) are
+    wildcards otherwise — reindex-prune deleted sibling trees, quarantine
+    vetoed the wrong row (audit C4/M1). Pair with ESCAPE '\'."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 _SCHEMA = """
@@ -193,6 +213,11 @@ CREATE TABLE IF NOT EXISTS mem_served (
     tier TEXT NOT NULL,
     ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS run_outcome (
+    run_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    ts REAL NOT NULL
+);
 """
 
 _FTS_SCHEMA = """
@@ -219,9 +244,13 @@ DEFAULTS = {
     "index_budget_chars": 4000,
     "recall_top_k": 8,
     "episode_half_life_days": 30,
-    "max_episodes": 2000,
+    "max_episodes": 2000,          # per BANK, not global (audit M2)
     "compact_after_days": 90,
     "auto_compact": True,
+    # Where project-scoped notes are written under a project dir. Default keeps
+    # Ktisis parity (.ktisis/memory); standalone hosts can point it anywhere
+    # (audit: host-generic). Also the dir reindex(project) scans.
+    "project_subdir": ".ktisis/memory",
 }
 
 # Episodes may exceed max_episodes by this slack before an automatic compact
@@ -316,7 +345,10 @@ class Mneme:
     # -- reindex: files -> disposable mirror ----------------------------------
     @staticmethod
     def _file_key(path: Path) -> str:
-        return "file:" + path.resolve().as_posix().lower()
+        return "file:" + _norm_path(path)
+
+    def _project_root(self, repo: Path) -> Path:
+        return Path(repo) / self.cfg["project_subdir"]
 
     def reindex(self, repo: Path | None = None, force: bool = False) -> dict:
         """Mirror canon note files into the DB. mtime-based, idempotent, and
@@ -324,9 +356,9 @@ class Mneme:
         roots: list[tuple[Path, str]] = [(self.global_dir, "global")]
         roots += [(d, "global") for d in self.extra_dirs]
         if repo is not None:
-            roots.append((Path(repo) / ".ktisis" / "memory", self.bank_of(repo)))
+            roots.append((self._project_root(repo), self.bank_of(repo)))
         added = updated = pruned = 0
-        supersedes: list[tuple[str, str]] = []  # (new_key, superseded slug)
+        supersedes: list[tuple[str, str, str]] = []  # (new_key, superseded slug, bank)
         with self._lock:
             for root, bank in roots:
                 notes = scan_notes(root)
@@ -341,19 +373,23 @@ class Mneme:
                     self._upsert_locked(key, n.kind, bank, n.title, n.body, n.keywords,
                                         n.tags, str(n.path), n.pinned, n.mtime, n.valid_at)
                     if n.supersedes:
-                        supersedes.append((key, n.supersedes))
+                        supersedes.append((key, n.supersedes, bank))
                     added += 1 if row is None else 0
                     updated += 0 if row is None else 1
-                prefix = "file:" + root.resolve().as_posix().lower()
+                # Prune rows whose file vanished from THIS root. The prefix is a
+                # LIKE pattern — escape metachars and bound with a trailing '/'
+                # so `/a/proj` never matches `/a/proj2` or a `_`-wildcarded
+                # sibling (audit C4). Root files live at prefix + '/child.md'.
+                prefix = "file:" + _norm_path(root)
                 stale = self._conn.execute(
-                    "SELECT dedupe_key FROM mem WHERE dedupe_key LIKE ? || '%'",
-                    (prefix,)).fetchall()
+                    "SELECT dedupe_key FROM mem WHERE dedupe_key LIKE ? ESCAPE '\\'",
+                    (_like_escape(prefix) + "/%",)).fetchall()
                 for (key,) in stale:
                     if key not in seen_keys:
                         self._delete_locked(key)
                         pruned += 1
-            for new_key, target in supersedes:
-                self._supersede_locked(new_key, target)
+            for new_key, target, bank in supersedes:
+                self._supersede_locked(new_key, target, bank)
             self._conn.commit()
         return {"added": added, "updated": updated, "pruned": pruned,
                 "fts": self.fts_available}
@@ -388,14 +424,18 @@ class Mneme:
         if self.fts_available:
             self._conn.execute("DELETE FROM mem_fts WHERE dedupe_key=?", (key,))
 
-    def _supersede_locked(self, new_key: str, target: str) -> None:
+    def _supersede_locked(self, new_key: str, target: str, bank: str) -> None:
         """Mark older rows invalid instead of deleting them (bi-temporal).
-        Target matches a note filename stem or a slugified title."""
+        Target matches a note filename stem or a slugified title — SCOPED TO
+        THE SAME BANK. Without the bank filter a repo-A note's `supersedes:`
+        silently invalidated same-titled global/repo-B notes (audit C1: the
+        one place bank isolation was dropped)."""
         slug = slugify(target) or target.lower()
         now = time.time()
         rows = self._conn.execute(
-            "SELECT dedupe_key, title FROM mem WHERE invalid_at IS NULL AND dedupe_key != ?",
-            (new_key,)).fetchall()
+            "SELECT dedupe_key, title FROM mem WHERE invalid_at IS NULL"
+            " AND bank = ? AND dedupe_key != ?",
+            (bank, new_key)).fetchall()
         for key, title in rows:
             stem = key.rsplit("/", 1)[-1].removesuffix(".md")
             if stem == slug or slugify(title) == slug:
@@ -496,14 +536,21 @@ class Mneme:
         toks = _tokens(query)
         qs_banks = ",".join("?" * len(banks))
         rows: list[tuple] = []
+        # Quarantine is filtered INSIDE the candidate query (audit L1): filtering
+        # it post-LIMIT let a top-ranked quarantined row eat a slot and hide a
+        # legitimate row ranked past `limit`. LEFT JOIN + quarantined=0 so LIMIT
+        # applies only to eligible rows.
+        _FTS_SQL = (
+            "SELECT m.dedupe_key, m.kind, m.bank, m.title, m.body, m.keywords, m.tags,"
+            " m.pinned, m.valid_at, bm25(mem_fts) AS r"
+            " FROM mem_fts JOIN mem m ON m.dedupe_key = mem_fts.dedupe_key"
+            " LEFT JOIN mem_stats s ON s.dedupe_key = m.dedupe_key"
+            f" WHERE mem_fts MATCH ? AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
+            " AND COALESCE(s.quarantined, 0) = 0"
+            " ORDER BY r LIMIT ?")
         if toks and self.fts_available:
             match = " OR ".join(f'"{t}"' for t in toks)
-            rows = self._conn.execute(
-                f"SELECT m.dedupe_key, m.kind, m.bank, m.title, m.body, m.keywords, m.tags,"
-                f" m.pinned, m.valid_at, bm25(mem_fts) AS r"
-                f" FROM mem_fts JOIN mem m ON m.dedupe_key = mem_fts.dedupe_key"
-                f" WHERE mem_fts MATCH ? AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
-                f" ORDER BY r LIMIT ?", (match, *banks, limit)).fetchall()
+            rows = self._conn.execute(_FTS_SQL, (match, *banks, limit)).fetchall()
             if not rows:
                 # Empty-result rescue (bake-off verdict): co-occurrence expansion
                 # dilutes ranked results on the hot path, but when the strict
@@ -511,25 +558,28 @@ class Mneme:
                 wide = self._expand_tokens(toks)
                 if len(wide) > len(toks):
                     match = " OR ".join(f'"{t}"' for t in wide)
-                    rows = self._conn.execute(
-                        f"SELECT m.dedupe_key, m.kind, m.bank, m.title, m.body, m.keywords, m.tags,"
-                        f" m.pinned, m.valid_at, bm25(mem_fts) AS r"
-                        f" FROM mem_fts JOIN mem m ON m.dedupe_key = mem_fts.dedupe_key"
-                        f" WHERE mem_fts MATCH ? AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
-                        f" ORDER BY r LIMIT ?", (match, *banks, limit)).fetchall()
+                    rows = self._conn.execute(_FTS_SQL, (match, *banks, limit)).fetchall()
         elif toks:
-            like = " OR ".join(["title LIKE ? OR body LIKE ? OR keywords LIKE ? OR tags LIKE ?"] * min(len(toks), 8))
+            like = " OR ".join(["m.title LIKE ? OR m.body LIKE ? OR m.keywords LIKE ? OR m.tags LIKE ?"] * min(len(toks), 8))
             params: list = []
             for t in toks[:8]:
+                # tokens are [A-Za-z0-9_] — a stray '_' over-matches slightly but
+                # hit-count scoring self-corrects, so no ESCAPE needed here (this
+                # is a fuzzy candidate gather, not a destructive prefix match).
                 params += [f"%{t}%"] * 4
             found = self._conn.execute(
-                f"SELECT dedupe_key, kind, bank, title, body, keywords, tags, pinned, valid_at"
-                f" FROM mem WHERE ({like}) AND bank IN ({qs_banks}) AND invalid_at IS NULL LIMIT 400",
+                f"SELECT m.dedupe_key, m.kind, m.bank, m.title, m.body, m.keywords, m.tags, m.pinned, m.valid_at"
+                f" FROM mem m LEFT JOIN mem_stats s ON s.dedupe_key = m.dedupe_key"
+                f" WHERE ({like}) AND m.bank IN ({qs_banks}) AND m.invalid_at IS NULL"
+                f" AND COALESCE(s.quarantined, 0) = 0 LIMIT 400",
                 (*params, *banks)).fetchall()
             scored = []
             tokset = set(toks)
             for f in found:
-                text = (f[3] + " " + f[4][:2000] + " " + f[5] + " " + f[6]).lower()
+                # Score against the SAME full body the SQL LIKE matched (audit
+                # L2): truncating to 2000 here made a token past char 2000 count
+                # as a miss, diverging from what the query actually matched.
+                text = (f[3] + " " + f[4] + " " + f[5] + " " + f[6]).lower()
                 hits = sum(1 for t in tokset if t in text)
                 scored.append((*f, -float(hits)))  # negative = better, like bm25
             scored.sort(key=lambda x: (x[-1], x[0]))
@@ -572,15 +622,17 @@ class Mneme:
         k = top_k or self.cfg["recall_top_k"]
         return self.retrieve(query, repo, limit=max(32, k * 4))[:k]
 
-    @staticmethod
-    def _repo_hint(repo: Path | None) -> str:
-        """Query boost from the deterministic repo snapshot (languages and
-        frameworks): 'python pytest' pulls framework-specific memories in even
-        when the goal sentence never names the stack."""
+    def _repo_hint(self, repo: Path | None) -> str:
+        """Query boost from a host's repo snapshot (languages and frameworks):
+        'python pytest' pulls framework-specific memories in even when the goal
+        never names the stack. This is an OPTIONAL host integration — it reads
+        <repo>/<project_subdir-parent>/repo_snapshot.json if present and
+        fails safe (empty) everywhere else, so non-Ktisis hosts are unaffected."""
         if repo is None:
             return ""
+        snap = Path(repo) / self.cfg["project_subdir"].split("/")[0] / "repo_snapshot.json"
         try:
-            data = json.loads((Path(repo) / ".ktisis" / "repo_snapshot.json").read_text(encoding="utf-8"))
+            data = json.loads(snap.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return ""
         parts = []
@@ -641,12 +693,32 @@ class Mneme:
             sections[c["kind"]].append(line)
             chosen.append(c)
             used += len(line) + 1
-        parts = []
+        # Precise assembly (audit budget bug): the old code counted only line
+        # lengths in `used` but the emitted text also carries section HEADERS and
+        # "\n\n" separators, then hard-sliced with [:budget] — so trailing lines
+        # were counted as served yet cut from the text, and trust later moved for
+        # memories the agent never saw. Here we account for exact rendered length
+        # and take served keys ONLY from lines that actually fit.
+        picked: dict[str, list] = {k: [] for k in ("lesson", "fact", "preference", "episode")}
+        for c in chosen:
+            picked[c["kind"]].append((self._render_line(c), c["key"]))
+        parts, keys, total = [], [], 0
         for kind in ("lesson", "fact", "preference", "episode"):
-            if sections[kind]:
-                parts.append(_SECTION_HEADERS[kind] + "\n" + "\n".join(sections[kind]))
-        text = "\n\n".join(parts)[:budget]
-        keys = [c["key"] for c in chosen]
+            if not picked[kind]:
+                continue
+            sep = 2 if parts else 0  # "\n\n" before this section
+            seg_lines, seg_len, seg_keys = [], len(_SECTION_HEADERS[kind]), []
+            for line, key in picked[kind]:
+                if total + sep + seg_len + 1 + len(line) > budget:
+                    break
+                seg_lines.append(line)
+                seg_len += 1 + len(line)  # "\n" + line
+                seg_keys.append(key)
+            if seg_lines:
+                parts.append(_SECTION_HEADERS[kind] + "\n" + "\n".join(seg_lines))
+                total += sep + seg_len
+                keys.extend(seg_keys)
+        text = "\n\n".join(parts)
         if run_id and keys:
             self.record_served(run_id, keys, "index")
         return IndexBlock(text=text, keys=keys)
@@ -699,7 +771,10 @@ class Mneme:
 
     def apply_outcome(self, run_id: str, status: str) -> int:
         """Credit or debit every memory served in this run, based on the PROVEN
-        outcome. Neutral statuses change nothing. Returns rows touched."""
+        outcome. Neutral statuses change nothing. IDEMPOTENT per run_id: a
+        second call for the same run is a no-op (audit M3 — at-least-once/retry
+        delivery was double-counting trust, silently poisoning the signal the
+        module exists to provide). Returns rows touched (0 on a repeat)."""
         if status in POSITIVE_STATUSES:
             col = "positive"
         elif status in NEGATIVE_STATUSES:
@@ -707,56 +782,83 @@ class Mneme:
         else:
             return 0
         with self._lock:
+            if self._conn.execute("SELECT 1 FROM run_outcome WHERE run_id=?", (run_id,)).fetchone():
+                return 0  # this run's outcome was already applied
             keys = [r[0] for r in self._conn.execute(
                 "SELECT DISTINCT dedupe_key FROM mem_served WHERE run_id=?", (run_id,)).fetchall()]
             for key in keys:
                 self._conn.execute(
                     f"INSERT INTO mem_stats (dedupe_key, {col}) VALUES (?, 1)"
                     f" ON CONFLICT(dedupe_key) DO UPDATE SET {col} = {col} + 1", (key,))
+            self._conn.execute("INSERT INTO run_outcome (run_id, status, ts) VALUES (?,?,?)",
+                               (run_id, status, time.time()))
             self._conn.commit()
         return len(keys)
 
     def quarantine(self, key_or_slug: str, on: bool = True) -> bool:
         """Operator veto: a quarantined memory never surfaces anywhere except
-        `mneme show`. The note file is untouched — this is a store-level gate."""
+        `mneme show`. The note file is untouched — this is a store-level gate.
+        The slug LIKE is ESCAPE'd (audit M1 — a '_' in the slug was a wildcard,
+        vetoing the wrong row) and quarantines ALL same-stem matches (across
+        banks) so an operator veto is total, not one arbitrary row."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT dedupe_key FROM mem WHERE dedupe_key=? OR dedupe_key LIKE '%/' || ? || '.md'",
-                (key_or_slug, key_or_slug)).fetchone()
-            if row is None:
+            rows = self._conn.execute(
+                "SELECT dedupe_key FROM mem WHERE dedupe_key=?"
+                " OR dedupe_key LIKE '%/' || ? || '.md' ESCAPE '\\'",
+                (key_or_slug, _like_escape(key_or_slug))).fetchall()
+            if not rows:
                 return False
-            self._conn.execute(
-                "INSERT INTO mem_stats (dedupe_key, quarantined) VALUES (?, ?)"
-                " ON CONFLICT(dedupe_key) DO UPDATE SET quarantined = ?",
-                (row[0], int(on), int(on)))
+            for (dk,) in rows:
+                self._conn.execute(
+                    "INSERT INTO mem_stats (dedupe_key, quarantined) VALUES (?, ?)"
+                    " ON CONFLICT(dedupe_key) DO UPDATE SET quarantined = ?",
+                    (dk, int(on), int(on)))
             self._conn.commit()
         return True
 
     # -- lifecycle ------------------------------------------------------------
     def compact(self, archive_path: Path | None = None) -> dict:
         """Archive (never silently delete) episode overflow and long-invalidated
-        rows. Never-served episodes go first; canon files are never touched."""
+        rows. Episode overflow is computed PER BANK (audit M2 — a global cap let
+        a busy repo evict a quiet repo's episodes), never-served/oldest first.
+        The archive conserves mem_stats too (audit — trust/served counts were
+        silently lost on archive). Canon note files are never touched."""
+        from collections import defaultdict
         archive_path = archive_path or self.db_path.with_name("mneme_archive.db")
         cutoff = time.time() - self.cfg["compact_after_days"] * 86400
+        cap = int(self.cfg["max_episodes"])
         with self._lock:
             doomed = [r[0] for r in self._conn.execute(
                 "SELECT dedupe_key FROM mem WHERE invalid_at IS NOT NULL AND invalid_at < ?",
                 (cutoff,)).fetchall()]
+            doomed_set = set(doomed)
             episodes = self._conn.execute(
-                "SELECT m.dedupe_key, COALESCE(s.served, 0) FROM mem m"
+                "SELECT m.dedupe_key, m.bank, COALESCE(s.served, 0) FROM mem m"
                 " LEFT JOIN mem_stats s ON s.dedupe_key = m.dedupe_key"
                 " WHERE m.kind='episode' ORDER BY COALESCE(s.served,0) ASC, m.valid_at ASC").fetchall()
-            overflow = len(episodes) - int(self.cfg["max_episodes"])
-            if overflow > 0:
-                doomed += [k for k, _ in episodes[:overflow] if k not in doomed]
+            by_bank: dict = defaultdict(list)
+            for key, bank, _served in episodes:
+                by_bank[bank].append(key)
+            for bank, keys_in_bank in by_bank.items():
+                overflow = len(keys_in_bank) - cap
+                if overflow > 0:
+                    for k in keys_in_bank[:overflow]:
+                        if k not in doomed_set:
+                            doomed.append(k)
+                            doomed_set.add(k)
             if not doomed:
                 return {"archived": 0, "archive": str(archive_path)}
             arc = sqlite3.connect(str(archive_path))
-            arc.executescript(_SCHEMA.split("CREATE TABLE IF NOT EXISTS mem_stats")[0])
+            arc.executescript(_SCHEMA)  # full schema so mem_stats is conserved too
             qs = ",".join("?" * len(doomed))
-            rows = self._conn.execute(f"SELECT * FROM mem WHERE dedupe_key IN ({qs})", doomed).fetchall()
+            mem_rows = self._conn.execute(
+                f"SELECT * FROM mem WHERE dedupe_key IN ({qs})", doomed).fetchall()
             arc.executemany(
-                "INSERT OR REPLACE INTO mem VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "INSERT OR REPLACE INTO mem VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", mem_rows)
+            stat_rows = self._conn.execute(
+                f"SELECT * FROM mem_stats WHERE dedupe_key IN ({qs})", doomed).fetchall()
+            arc.executemany(
+                "INSERT OR REPLACE INTO mem_stats VALUES (?,?,?,?,?)", stat_rows)
             arc.commit()
             arc.close()
             for key in doomed:
@@ -799,7 +901,7 @@ class Mneme:
         slug = slugify(title)
         if not slug:
             raise ValueError("title produced an empty slug")
-        root = (Path(repo) / ".ktisis" / "memory") if repo else (self.global_dir / f"{kind}s")
+        root = self._project_root(repo) if repo else (self.global_dir / f"{kind}s")
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{slug}.md"
         if not overwrite and path.exists():
@@ -823,7 +925,7 @@ class Mneme:
             self._upsert_locked(key, n.kind, bank, n.title, n.body, n.keywords,
                                 n.tags, str(n.path), n.pinned, n.mtime, n.valid_at)
             if n.supersedes:
-                self._supersede_locked(key, n.supersedes)
+                self._supersede_locked(key, n.supersedes, bank)
             self._conn.commit()
 
     # === Unified agent-facing API =========================================
@@ -844,15 +946,23 @@ class Mneme:
 
     def audit(self):
         """Whole-store health: counts, served-vs-never (graveyard detector),
-        trust distribution, quarantine, fts mode."""
+        trust distribution, quarantine, fts mode. graveyard_ratio is over LIVE
+        NON-EPISODE notes only (audit M4 — including superseded rows and episodes
+        in the denominator trended the ratio to ~1.0 regardless of real usage)."""
         s = self.stats()
         with self._lock:
+            live = self._conn.execute(
+                "SELECT COUNT(*) FROM mem WHERE invalid_at IS NULL AND kind != 'episode'").fetchone()[0]
+            served_live = self._conn.execute(
+                "SELECT COUNT(*) FROM mem m JOIN mem_stats st ON st.dedupe_key = m.dedupe_key"
+                " WHERE m.invalid_at IS NULL AND m.kind != 'episode' AND st.served > 0").fetchone()[0]
             dist = self._conn.execute(
                 "SELECT positive, negative FROM mem_stats WHERE positive+negative > 0").fetchall()
         trusts = [(pos + 1) / (pos + neg + 2) for pos, neg in dist]
         s["trust_evaluated"] = len(trusts)
         s["trust_mean"] = round(sum(trusts) / len(trusts), 3) if trusts else None
-        s["graveyard_ratio"] = round(s["never_served"] / s["rows"], 3) if s["rows"] else 0.0
+        s["live_notes"] = live
+        s["graveyard_ratio"] = round((live - served_live) / live, 3) if live else 0.0
         return s
 
     def explain_recall(self, query, project=None, top_k=5):
@@ -902,7 +1012,12 @@ class Mneme:
 
     def export_memory(self, path=None):
         """MEMORY.md-style portable snapshot: all live notes as ONE readable
-        markdown doc (kind-sectioned). Importable back via import_memory()."""
+        markdown doc (kind-sectioned). Round-trips losslessly via import_memory:
+        body lines are INDENTED 4 spaces so a body line like '## Heading' can't
+        be mistaken for structure (audit C2), and bank/keywords/tags/pinned ride
+        in the title-line comment (audit C3). Note: `bank` is exported for
+        reference but import re-scopes to the import-time project (add_note has
+        no bank override) — see import_memory."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT kind, bank, title, body, keywords, tags, pinned FROM mem "
@@ -927,32 +1042,58 @@ class Mneme:
                 head += "  <!-- " + "; ".join(meta) + " -->"
             parts.append(head)
             if body.strip():
-                parts += [body.strip(), ""]
+                parts += ["    " + ln if ln.strip() else "" for ln in body.splitlines()]
+                parts.append("")
         text = _NL.join(parts) + _NL
         if path:
             Path(path).write_text(text, encoding="utf-8")
         return text
 
+    @staticmethod
+    def _parse_export_meta(comment: str) -> dict:
+        """Parse a `bank=..; keywords=..; tags=..; pinned` export comment."""
+        out = {"keywords": "", "tags": "", "pinned": False}
+        for part in comment.split(";"):
+            part = part.strip()
+            if part == "pinned":
+                out["pinned"] = True
+            elif part.startswith("keywords="):
+                out["keywords"] = part[len("keywords="):].strip()
+            elif part.startswith("tags="):
+                out["tags"] = part[len("tags="):].strip()
+        return out
+
     def import_memory(self, path_or_text, project=None):
         """Parse an export_memory() snapshot back into notes. ADD-only: existing
-        slugs untouched. Returns count written."""
+        slugs untouched. Restores keywords/tags/pinned from the export comment
+        (audit C3); notes re-scope to `project` (bank is not reconstructable via
+        add_note). The path-vs-text heuristic only treats the input as a path if
+        it is a single line with no newline AND that file exists. Returns count
+        written."""
         import re as _re
         raw = path_or_text
-        cand = Path(path_or_text) if len(path_or_text) < 400 else None
-        if cand is not None and cand.exists():
-            raw = cand.read_text(encoding="utf-8")
-        state = {"kind": "lesson", "written": 0, "title": None, "buf": []}
+        if "\n" not in path_or_text and len(path_or_text) < 4096:
+            try:
+                cand = Path(path_or_text)
+                if cand.exists():
+                    raw = cand.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                pass  # not a usable path — treat the string as literal snapshot
+        state = {"kind": "lesson", "written": 0, "title": None, "meta": None, "buf": []}
 
         def flush():
             if state["title"]:
                 body = _NL.join(state["buf"]).strip()
+                m = state["meta"] or {"keywords": "", "tags": "", "pinned": False}
                 try:
-                    if self.add_note(state["kind"], state["title"], body, tags="imported",
-                                     repo=project, overwrite=False) is not None:
+                    if self.add_note(state["kind"], state["title"], body,
+                                     keywords=m["keywords"], tags=m["tags"],
+                                     pinned=m["pinned"], repo=project,
+                                     overwrite=False) is not None:
                         state["written"] += 1
                 except ValueError:
                     pass
-            state["title"], state["buf"] = None, []
+            state["title"], state["meta"], state["buf"] = None, None, []
 
         for line in raw.splitlines():
             if line.startswith("## ") and not line.startswith("### "):
@@ -961,9 +1102,13 @@ class Mneme:
                 state["kind"] = k if k in ("lesson", "fact", "preference") else "lesson"
             elif line.startswith("### "):
                 flush()
-                state["title"] = _re.sub(r"\s*<!--.*?-->\s*", "", line[4:]).strip()
+                head = line[4:]
+                cm = _re.search(r"<!--(.*?)-->", head)
+                state["meta"] = self._parse_export_meta(cm.group(1)) if cm else None
+                state["title"] = _re.sub(r"\s*<!--.*?-->\s*", "", head).strip()
             elif state["title"] is not None:
-                state["buf"].append(line)
+                # body lines are exported indented 4 spaces; strip exactly that
+                state["buf"].append(line[4:] if line.startswith("    ") else line)
         flush()
         return state["written"]
 
@@ -986,10 +1131,14 @@ def _cli() -> int:
         choices=["lesson", "fact", "preference"]); p_add.add_argument("--title", required=True)
     p_add.add_argument("--body", default=""); p_add.add_argument("--keywords", default="")
     p_add.add_argument("--tags", default=""); p_add.add_argument("--pin", action="store_true")
+    p_add.add_argument("--supersedes", default="", help="slug of a note this one replaces")
     p_rec = sub.add_parser("recall"); p_rec.add_argument("query")
     p_show = sub.add_parser("show"); p_show.add_argument("query", nargs="?", default="")
-    sub.add_parser("stats"); sub.add_parser("reindex"); sub.add_parser("compact")
+    sub.add_parser("stats"); sub.add_parser("audit")
+    sub.add_parser("reindex"); sub.add_parser("compact")
     p_q = sub.add_parser("quarantine"); p_q.add_argument("slug"); p_q.add_argument("--off", action="store_true")
+    p_exp = sub.add_parser("export"); p_exp.add_argument("--out", default="", help="write to file (else stdout)")
+    p_imp = sub.add_parser("import"); p_imp.add_argument("file", help="snapshot file to import")
     args = ap.parse_args()
 
     home = Path(args.dir); home.mkdir(parents=True, exist_ok=True)
@@ -998,7 +1147,8 @@ def _cli() -> int:
     mem.reindex(project)
     if args.cmd == "add":
         path = mem.add_note(args.kind, args.title, args.body, keywords=args.keywords,
-                            tags=args.tags, pinned=args.pin, repo=project)
+                            tags=args.tags, pinned=args.pin, supersedes=args.supersedes,
+                            repo=project)
         print(f"note written: {path}")
     elif args.cmd == "recall":
         for h in mem.recall(args.query, project):
@@ -1007,12 +1157,19 @@ def _cli() -> int:
         print(mem.index_block(project, args.query).text or "(empty index block)")
     elif args.cmd == "stats":
         print(_json.dumps(mem.stats(), indent=2))
+    elif args.cmd == "audit":
+        print(_json.dumps(mem.audit(), indent=2))
     elif args.cmd == "reindex":
         print(_json.dumps(mem.reindex(project, force=True)))
     elif args.cmd == "compact":
         print(_json.dumps(mem.compact()))
     elif args.cmd == "quarantine":
         print("ok" if mem.quarantine(args.slug, on=not args.off) else "no such memory")
+    elif args.cmd == "export":
+        text = mem.export_memory(args.out or None)
+        print(f"exported to {args.out}" if args.out else text, end="" if args.out else "\n")
+    elif args.cmd == "import":
+        print(f"imported {mem.import_memory(args.file, project)} note(s)")
     return 0
 
 

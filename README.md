@@ -30,6 +30,11 @@ User-space only (no sudo/admin), self-tests on install, needs Python 3.11+
 and nothing else. Then hand your AI agent `~/.mneme/HANDOFF.md` and it wires
 itself in. Or skip the installer entirely: `mneme.py` is one file — copy it.
 
+Standard `curl | sh` trust model applies: the script fetches over HTTPS from
+this repo and runs a self-test. Setting `MNEME_REPO` points the installer at a
+different origin and it will execute whatever that host serves — only override
+it with a trusted HTTPS source. Prefer to read first? Same URL without `| sh`.
+
 ## Why another memory layer
 
 Built after a deep research pass across Mem0, Zep/Graphiti, MemGPT/Letta, A-MEM,
@@ -65,15 +70,22 @@ your-agent/
                               delete it, reindex, nothing is lost
 ```
 
-- **Retrieval**: FTS5/BM25 with porter stemming → trigram-Jaccard re-rank →
-  × trust × recency-decay (episodes only). Pure-Python LIKE fallback if your
-  SQLite lacks FTS5.
+- **Retrieval**: FTS5/BM25 (porter-stemmed) is the primary signal, with a
+  trigram-Jaccard tie-breaker, all × trust × recency-decay (episodes only).
+  Lexical precision holds flat under distractor noise from 100 to 2000+ entries
+  (see `bench/`); synonym-only queries benefit from author-supplied `keywords:`.
+  Pure-Python LIKE fallback if your SQLite lacks FTS5.
 - **Banks**: per-project scoping (hash of git remote / path) — project A's facts
-  never surface in project B.
-- **Index block**: budget-capped (default 4000 chars), pinned notes always
-  included, per-kind shares so run history can't starve lessons.
-- **Lifecycle**: episodes auto-compact to an archive db past a cap. Quarantine
-  hides a bad memory everywhere without touching your file.
+  never surface in project B, and one project can never supersede or evict
+  another's memories.
+- **Index block**: budget-capped (default 4000 chars, headers/separators
+  counted), pinned notes first, per-kind shares so run history can't starve
+  lessons. Every served key is guaranteed to appear in the emitted block.
+- **Lifecycle**: episodes auto-compact to an archive db past a **per-bank** cap
+  (`max_episodes`, default 2000/bank). Quarantine hides a bad memory everywhere
+  without touching your file. Project-scoped notes are written under
+  `<project>/.ktisis/memory` by default — override via the `project_subdir`
+  config key for a non-Ktisis layout.
 
 ## One layer, one interface
 
@@ -112,19 +124,24 @@ prompt = f"{block.text}\n\n{task_prompt}"
 hits = mem.recall("flask blueprint 404", project_dir)
 
 # 3. close the loop with a PROVEN outcome ("done" | "rolled_back" | ...)
-mem.apply_outcome(run_id, "done")             # served memories earn trust
+mem.record_outcome(run_id, "done")            # served memories earn trust
+#   record_outcome is idempotent per run_id — a retry/duplicate close is a no-op,
+#   and only mechanical results or an explicit operator verdict should call it.
 ```
 
-Writes: `mem.add_note("lesson", title, body, keywords=..., pinned=...)` — or just
+Writes: `mem.remember(title, body, kind=..., keywords=..., pinned=...)` — or just
 drop a markdown file in the notes folder; the next reindex picks it up.
 
 ## CLI
 
 ```
-python mneme.py --dir ./mneme-data add --kind lesson --title "..." [--body ...] [--pin]
+python mneme.py --dir ./mneme-data add --title "..." [--kind lesson|fact|preference] [--body ...] [--keywords ...] [--pin] [--supersedes <slug>]
 python mneme.py --dir ./mneme-data recall "search terms"
-python mneme.py --dir ./mneme-data show ["query"]     # the exact block an agent would get
-python mneme.py --dir ./mneme-data stats | reindex | compact | quarantine <slug>
+python mneme.py --dir ./mneme-data show ["query"]        # the exact block an agent would get
+python mneme.py --dir ./mneme-data stats | audit         # audit = graveyard ratio + trust distribution
+python mneme.py --dir ./mneme-data reindex | compact
+python mneme.py --dir ./mneme-data quarantine <slug> [--off]   # --off un-quarantines
+python mneme.py --dir ./mneme-data export [--out snapshot.md] | import snapshot.md
 ```
 
 ## Requirements

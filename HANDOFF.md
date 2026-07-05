@@ -77,8 +77,10 @@ that can read files and edit your agent's source):
   `explain_recall()` shows exactly why any memory ranked where it did.
 
 Honest limits, so you're not oversold: retrieval is lexical (BM25 + porter
-stemming) — precision holds flat to 2000+ entries (measured, harness in the
-repo), but synonym-heavy queries benefit from adding `keywords:` to notes.
-Semantic embedding re-rank is on the roadmap as an optional flag.
+stemming). Measured precision@3 on adversarially paraphrased queries is ~0.56
+and stays flat from 100 to 2000 entries (`bench/scale_bench.py` in the repo) at
+~1ms median recall — it does not degrade with scale, but synonym-only queries
+that share no words with your notes are its ceiling; adding `keywords:` to notes
+lifts them. Semantic embedding re-rank is on the roadmap as an optional flag.
 
 Repo, PRD, research provenance, benchmarks: https://github.com/trollbot2012/mneme
