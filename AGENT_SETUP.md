@@ -23,6 +23,18 @@ Answer these by reading the host's code, not its docs (docs lie; read paths don'
    proven success → `"done"`, proven failure → `"rolled_back"`. If the host has
    no proven-outcome signal, wire serves only — trust stays flat at 0.5 and
    retrieval still works; say so in your report.
+
+   **What counts as proven (trust-integrity rules — violating these corrupts
+   the system's defining feature):**
+   - Mechanical results: exit codes, verification gates, cron/job ok-vs-error.
+   - The operator's EXPLICIT verdict ("that worked" / "that was wrong") — if
+     you expose this as a tool, require the operator's quoted words as a
+     parameter so every trust movement is auditable, and forbid the model
+     from calling it on its own judgment.
+   - NOTHING ELSE. A session ending is not success. A turn completing is not
+     success. The model thinking it did well is never success. Statuses
+     outside done/rolled_back/failed_verification are neutral by design —
+     use them (e.g. "session_end") for everything unproven.
 3. **Tool surface**: how the model requests things mid-task (tool calls, slash
    commands). That's where `recall` gets exposed.
 4. **State home**: where the host keeps per-install mutable state. Mneme's data
@@ -104,6 +116,11 @@ smoke evidence, and anything from Step 0.5 you mounted or deliberately left alon
 - **Unpinned prose**: if the operator has rules that MUST hold, they belong in
   the host's enforcement (checks/hooks), not in a memory note. Notes are
   advisory context.
+- **Attendance-trophy trust** (caught in the first production install): wiring
+  `record_outcome(run_id, "done")` into session-end or turn-end hooks credits
+  every served memory for merely existing — trust inflates monotonically and
+  becomes meaningless within days. Session boundaries record NEUTRAL episodes;
+  only mechanical results or explicit operator verdicts move trust.
 
 ---
 
