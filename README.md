@@ -12,6 +12,24 @@ every serve is metered, and one command proves the whole loop end to end.
 pip? no. server? no. embeddings? no. just:  python mneme.py --dir ./m add --title "..."
 ```
 
+## Install (one command)
+
+macOS / Linux / Git Bash:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/trollbot2012/mneme/master/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/trollbot2012/mneme/master/install.ps1 | iex
+```
+
+User-space only (no sudo/admin), self-tests on install, needs Python 3.11+
+and nothing else. Then hand your AI agent `~/.mneme/HANDOFF.md` and it wires
+itself in. Or skip the installer entirely: `mneme.py` is one file — copy it.
+
 ## Why another memory layer
 
 Built after a deep research pass across Mem0, Zep/Graphiti, MemGPT/Letta, A-MEM,
