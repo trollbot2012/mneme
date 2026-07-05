@@ -107,31 +107,12 @@ smoke evidence, and anything from Step 0.5 you mounted or deliberately left alon
 
 ---
 
-## Host profile: Hermes (Big A / aletheon gateway) — for the agent doing this install
+---
 
-Facts verified 2026-07-04/05 on the operator's machine (see MEMORY-MAP.md at the
-hermes root for the full audit):
+## Writing a host profile
 
-- **Context assembly point**: the gateway injects `profiles\aletheon\SOUL.md` +
-  `profiles\aletheon\memories\MEMORY.md` + `USER.md` at session start (flags
-  `memory_enabled`/`user_profile_enabled`; snapshot frozen at session start for
-  prompt caching). Wire `index_block()` adjacent to the MEMORY.md injection —
-  do NOT remove MEMORY.md; mount it read-only via `extra_dirs` so its content
-  competes in ranking instead of being lost.
-- **State home**: `profiles\aletheon\` — put data in `profiles\aletheon\mneme\`.
-- **Outcome signal**: cron job results (ok/error per run) and command exit codes;
-  map job-ok → "done", job-error → "rolled_back", chat turns → neutral.
-- **Recall surface**: the gateway's plugin/tool registry (Hindsight already
-  registers 3 tools per session — same mechanism). Mneme recall can run beside
-  Hindsight; if replacing it, note Hindsight's shared-bank bleed (`bank_id
-  "hermes"` in `profiles\aletheon\hindsight\config.json`) — Mneme banks fix
-  this per-project.
-- **Acceptance evidence**: Hermes doctrine — verify injection by line-match in
-  the newest `sessions\request_dump_*.json`, and extend
-  `profiles\aletheon\scripts\memory_smoke_check.py` (cron job
-  `memory-smoke-check`, daily 06:30) to cover the Mneme canary. Prompt-cache
-  note: the session snapshot is FROZEN at start — a canary lands in the NEXT
-  session's dump, not the current one.
-- **Do not touch**: the root-level `memories\MEMORY.md` (dead for Big A, contains
-  legacy config), `memory-bank\` (write-only legacy), archived stores under
-  `_backups\`. Mount nothing from these without the operator's say-so.
+Before handing this document to an installing agent, append a **host profile**
+section for your specific system: the verified context-assembly point, state
+home, outcome signal, tool surface, existing memory stores to mount or avoid,
+and where the agent can capture a real prompt for the smoke check. The more
+verified facts you pin, the fewer the agent has to rediscover.
