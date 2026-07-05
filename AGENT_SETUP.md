@@ -62,8 +62,13 @@ mem.reindex(project_dir)          # cheap mtime scan; project_dir may be None
 ib = mem.index_block(project_dir, task_or_session_text, run_id=run_id)
 context = ib.text + "\n\n" + existing_context     # ib.keys = what was served
 
-# (b) at task/run end, ONLY on proven outcomes:
-mem.apply_outcome(run_id, "done" | "rolled_back")   # anything else = neutral
+# (b) at task/run end, ONLY on proven outcomes. Pass used_keys — the served
+#     keys the model actually consulted/acted on (e.g. everything it fetched
+#     via recall). USED memories move a full trust point; merely-served ones
+#     gain NOTHING on a win (that was the rich-get-richer bug):
+used = mem.served_keys(run_id, tier="recall")        # honest usage evidence
+mem.apply_outcome(run_id, "done" | "rolled_back",
+                  used_keys=used or None)            # anything else = neutral
 
 # (c) as a model-callable tool (mid-task search):
 hits = mem.recall(query, project_dir)   # list of {kind,title,body,trust,score}
@@ -94,7 +99,9 @@ with kind ∈ lesson|fact|preference. `pinned=True` = always in context.
 2. **Bank isolation**: a note added with `repo=project_A` must NOT appear in
    `index_block(project_B, ...)`.
 3. **Rebuild**: delete `mneme.db`, `reindex()`, and assert `index_block` output
-   for the same query is identical (trust counters reset is expected and OK).
+   for the same query is identical — INCLUDING trust counters and quarantine,
+   which restore from the canon sidecars under `notes/.mneme/`. A rebuild that
+   loses either is a failed install.
 4. **Non-fatality**: point Mneme at an unwritable path and assert the host still
    completes a task (memory failure logged, run unharmed).
 5. **Outcome coupling** (if Step 0.2 found a signal): run one succeeding and one

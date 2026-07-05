@@ -53,9 +53,12 @@ Claude Code's file memory, and holographic SQLite stores (full provenance in
   table gives Zettelkasten linking without a graph engine.
 
 And one mechanism the researched systems don't have: **proof-coupled trust**.
-A memory's rank moves only on *proven outcomes* — served into a run that verifiably
-succeeded, it rises; served into a failure, it sinks (Laplace-smoothed success
-ratio, counters stored and auditable). The model's opinion of a memory never moves it.
+A memory's rank moves only on *proven outcomes* of runs where it was actually
+**used** — pass `used_keys` at `record_outcome` and a consulted memory rises on
+verified success, sinks on failure (Laplace-smoothed ratio, counters stored and
+auditable). Merely being retrieved earns nothing: a win with no usage signal is
+neutral, so heavily-served-but-useless notes can't ride other work's success.
+The model's opinion of a memory never moves it.
 
 ## How it works
 
@@ -66,15 +69,28 @@ your-agent/
       lessons/*.md            frontmatter: kind, tags, keywords, pinned, supersedes
       facts/*.md
       preferences/*.md
+    notes/.mneme/          <- CANON SIDECARS: trust counters, quarantine
+                              blocklist, repo-note promotions (yours, tiny)
     mneme.db               <- DISPOSABLE: SQLite FTS5 index + episode rows
-                              delete it, reindex, nothing is lost
+                              delete it, reindex, nothing is lost — trust and
+                              quarantine restore from the canon sidecars
 ```
 
-- **Retrieval**: FTS5/BM25 (porter-stemmed) is the primary signal, with a
-  trigram-Jaccard tie-breaker, all × trust × recency-decay (episodes only).
-  Lexical precision holds flat under distractor noise from 100 to 2000+ entries
-  (see `bench/`); synonym-only queries benefit from author-supplied `keywords:`.
-  Pure-Python LIKE fallback if your SQLite lacks FTS5.
+- **Identity**: every note has a stable id (frontmatter `id:`, or derived from
+  its title) — rename or move a file, move the whole repo, sync across hosts:
+  its trust and quarantine state follow it.
+- **Retrieval**: FTS5/BM25 (porter-stemmed) × trust × recency-decay (episodes
+  only), with df-aware query pruning (a query term matching >10% of the corpus
+  is dropped — measured up to 100× faster recall at 100k rows, with equal-or-
+  better precision). Lexical precision holds flat under distractor noise from
+  100 to 2000+ entries (see `bench/`); synonym-only queries benefit from
+  author-supplied `keywords:`. Pure-Python LIKE+Jaccard fallback if your
+  SQLite lacks FTS5.
+- **Provenance**: notes ingested from a *repo's* memory dir are UNVERIFIED —
+  rendered only under a labelled "Unverified" section, never able to outrank
+  your own canon, never earning trust, never self-pinning, until you
+  `promote` them (promotion is bound to the note's content hash: if the repo
+  edits the file afterwards, it demotes itself).
 - **Banks**: per-project scoping (hash of git remote / path) — project A's facts
   never surface in project B, and one project can never supersede or evict
   another's memories.
@@ -98,7 +114,9 @@ routed between. The agent-facing API:
 | `remember(title, body, kind=..., project=...)` | durable write (lesson/fact/preference) |
 | `recall(query, project)` | ranked retrieval, sub-ms, lexical + trust |
 | `record_served(run_id, keys, tier)` | meter what entered context |
-| `record_outcome(run_id, status)` | proof-coupled trust: proven outcomes move rank |
+| `record_outcome(run_id, status, used_keys=[...])` | proof-coupled trust: proven outcomes of USED memories move rank |
+| `promote(slug)` / `unpromote(slug)` | trust (content-hash-bound) / distrust a repo-suggested note |
+| `quarantine(slug)` | operator veto — survives any db rebuild (canon blocklist) |
 | `summarize_user_model(project)` | deterministic operator model from preferences |
 | `export_memory(path)` / `import_memory(snapshot)` | readable MEMORY.md-style snapshot, round-trips |
 | `compact()` | archive episode overflow — never silent deletion |

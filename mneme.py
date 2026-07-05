@@ -274,6 +274,10 @@ DEFAULTS = {
     # Ktisis parity (.ktisis/memory); standalone hosts can point it anywhere
     # (audit: host-generic). Also the dir reindex(project) scans.
     "project_subdir": ".ktisis/memory",
+    # Row count below which df-aware query-term pruning stays off (benches can
+    # lower this to prove p@3 is unchanged with pruning active). Mirrors
+    # DF_PRUNE_MIN_ROWS below (defined after this dict).
+    "df_prune_min_rows": 2000,
 }
 
 # Episodes may exceed max_episodes by this slack before an automatic compact
@@ -296,6 +300,24 @@ SERVED_UNUSED_NEG = 0.1
 # Score multiplier for unverified (repo-credibility) notes: they may surface,
 # clearly labelled, but must never outrank trusted canon by default.
 UNVERIFIED_WEIGHT = 0.3
+
+# Ranking blend — ONE source of truth (the 0.65/0.35 literal used to live in
+# three places). Trigram-Jaccard is DROPPED when FTS5 ranks candidates: the
+# bakeoff shows byte-identical p@3 at every scale while doubling per-candidate
+# scoring cost (bm25 0.52/0.56 == bm25+jaccard 0.52/0.56 at 1000/2000). On the
+# FTS-less LIKE fallback, hit-count is the only lexical signal, so Jaccard
+# keeps its old weight there — it genuinely re-ranks that path.
+LEX_WEIGHT, JAC_WEIGHT = 1.0, 0.0            # fts_available
+FALLBACK_LEX_WEIGHT, FALLBACK_JAC_WEIGHT = 0.65, 0.35  # LIKE fallback
+
+# df-aware query-term pruning (measured 3-64x recall speedup at 100k rows):
+# a term matching more than DF_PRUNE_RATIO of the corpus forces FTS5 to
+# bm25-score a huge candidate union; dropping it keeps the rare terms that
+# carry the ranking anyway. Inactive below DF_PRUNE_MIN_ROWS (small stores
+# are already sub-ms, and the bakeoff corpus proves p@3 is unchanged there).
+DF_PRUNE_MIN_ROWS = 2000
+DF_PRUNE_RATIO = 0.10
+DF_PRUNE_KEEP_MIN = 3
 
 _UNVERIFIED_HEADER = "Unverified notes suggested by this repo (verify before trusting):"
 _UNVERIFIED_MAX_LINES = 3
@@ -338,6 +360,7 @@ class Mneme:
         self.cfg = cfg
         self._bank_cache: dict[str, str] = {}
         self._cooc = None  # lazy co-occurrence expansion table
+        self._df_cache: dict[str, int] = {}  # token -> document frequency
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         # RLock: _with_write_retry holds it across attempt AND rollback so a
@@ -640,15 +663,34 @@ class Mneme:
         supersedes: list[tuple[str, str, str, bool, str]] = []
         with self._lock:
             for root, bank in roots:
-                notes = scan_notes(root)
+                # Warm-path economy (verify F12-scale): stat BEFORE read — an
+                # unchanged corpus does zero full file reads — and ONE batched
+                # mtime SELECT per root instead of one query per file
+                # (measured: warm reindex of 20k files was 6.25s, mostly
+                # read_text on files the mtime gate was about to skip).
+                prefix = "file:" + _norm_path(root)
+                known = dict(self._conn.execute(
+                    "SELECT dedupe_key, file_mtime FROM mem WHERE dedupe_key LIKE ? ESCAPE '\\'",
+                    (_like_escape(prefix) + "/%",)).fetchall())
                 seen_keys = set()
-                for n in notes:
-                    key = self._file_key(n.path)
-                    seen_keys.add(key)
-                    row = self._conn.execute(
-                        "SELECT file_mtime FROM mem WHERE dedupe_key=?", (key,)).fetchone()
-                    if row is not None and not force and row[0] == n.mtime:
+                if root.is_dir():
+                    files = sorted(root.rglob("*.md"))
+                else:
+                    files = []
+                for f in files:
+                    key = self._file_key(f)
+                    try:
+                        mtime = f.stat().st_mtime
+                    except OSError:
                         continue
+                    existed = key in known
+                    if existed and not force and known[key] == mtime:
+                        seen_keys.add(key)  # unchanged: proven parseable at index time
+                        continue
+                    n = parse_note(f)
+                    if n is None:
+                        continue  # empty/corrupt: NOT seen, so a stale row prunes
+                    seen_keys.add(key)
                     cred = self._note_credibility(n, bank, promoted)
                     self._upsert_locked(key, n.kind, bank, n.title, n.body, n.keywords,
                                         n.tags, str(n.path), n.pinned, n.mtime, n.valid_at,
@@ -656,17 +698,12 @@ class Mneme:
                                         credibility=cred)
                     if n.supersedes:
                         supersedes.append((key, n.supersedes, bank, n.pinned, cred))
-                    added += 1 if row is None else 0
-                    updated += 0 if row is None else 1
-                # Prune rows whose file vanished from THIS root. The prefix is a
-                # LIKE pattern — escape metachars and bound with a trailing '/'
-                # so `/a/proj` never matches `/a/proj2` or a `_`-wildcarded
-                # sibling (audit C4). Root files live at prefix + '/child.md'.
-                prefix = "file:" + _norm_path(root)
-                stale = self._conn.execute(
-                    "SELECT dedupe_key FROM mem WHERE dedupe_key LIKE ? ESCAPE '\\'",
-                    (_like_escape(prefix) + "/%",)).fetchall()
-                for (key,) in stale:
+                    added += 0 if existed else 1
+                    updated += 1 if existed else 0
+                # Prune rows whose file vanished from THIS root — `known` was
+                # gathered with the escaped, '/'-bounded LIKE prefix (audit C4),
+                # so it is exactly this root's rows.
+                for key in known:
                     if key not in seen_keys:
                         self._delete_locked(key)
                         pruned += 1
@@ -706,6 +743,7 @@ class Mneme:
 
     def _invalidate_cooc(self) -> None:
         self._cooc = None
+        self._df_cache.clear()  # writes change document frequencies too
 
     def _delete_locked(self, key: str) -> None:
         # mem_stats is deliberately NOT cleaned here: stats are keyed by the
@@ -765,8 +803,12 @@ class Mneme:
                         "INSERT INTO mem_fts (dedupe_key, title, body, keywords, tags) VALUES (?,?,?,?,?)",
                         (key, title, detail[:2000], "", status))
                 self._conn.commit()
+                # BANK-scoped trigger: max_episodes is per bank, and counting
+                # globally made every add_episode past ~cap+slack TOTAL run a
+                # full cross-bank compact scan (design review F: unit mismatch).
                 return self._conn.execute(
-                    "SELECT COUNT(*) FROM mem WHERE kind='episode'").fetchone()[0]
+                    "SELECT COUNT(*) FROM mem WHERE kind='episode' AND bank=?",
+                    (self.bank_of(repo),)).fetchone()[0]
 
         episode_count = self._with_write_retry(_do)
         # Outside the lock (compact re-acquires it): amortized self-maintenance.
@@ -839,10 +881,46 @@ class Mneme:
             out += co.get(t, [])
         return list(dict.fromkeys(out))[:48]
 
+    def _prune_common_terms(self, toks: list) -> list:
+        """df-aware pruning (measured 3-64x recall speedup at 100k rows): FTS5
+        evaluates OR by unioning every term's posting list and bm25-scoring the
+        union, so ONE common query word ('note', 'file') makes recall O(corpus).
+        Drop terms matching more than DF_PRUNE_RATIO of rows — the rare terms
+        carry the ranking anyway. Off below df_prune_min_rows; keeps at least
+        the DF_PRUNE_KEEP_MIN rarest terms so a query can never prune to less."""
+        if not self.fts_available or len(toks) < 2:
+            return toks
+        total = self._conn.execute("SELECT COUNT(*) FROM mem").fetchone()[0]
+        if total < int(self.cfg.get("df_prune_min_rows", DF_PRUNE_MIN_ROWS)):
+            return toks
+        cutoff = total * DF_PRUNE_RATIO
+        dfs = []
+        for t in toks:
+            df = self._df_cache.get(t)
+            if df is None:
+                try:
+                    df = self._conn.execute(
+                        "SELECT COUNT(*) FROM mem_fts WHERE mem_fts MATCH ?",
+                        (f'"{t}"',)).fetchone()[0]
+                except sqlite3.OperationalError:
+                    df = 0  # unparseable token: harmless, keep it
+                self._df_cache[t] = df
+            dfs.append((df, t))
+        kept = [t for df, t in dfs if df <= cutoff]
+        if kept:
+            # Any rare term carries the query alone — padding back common terms
+            # would reintroduce the O(corpus) union ('note 54321' must query
+            # just '54321', the whole point of the prototype's 64x win).
+            return kept
+        dfs.sort()  # ALL terms common: fall back to the KEEP_MIN rarest
+        return [t for _df, t in dfs[:DF_PRUNE_KEEP_MIN]]
+
     def _candidates(self, query: str, banks: tuple, limit: int = 64) -> list[dict]:
         """Lexical candidates: FTS5/BM25 (porter-stemmed) when available, else
         LIKE token matching. Returns rows with a normalized lexical score."""
         toks = _tokens(query)
+        if toks and self.fts_available:
+            toks = self._prune_common_terms(toks)
         qs_banks = ",".join("?" * len(banks))
         rows: list[tuple] = []
         # Quarantine is filtered INSIDE the candidate query (audit L1): filtering
@@ -907,25 +985,34 @@ class Mneme:
                         "credibility": r[9], "lex": (hi - r[-1]) / span})
         return out
 
+    def _weights(self) -> tuple[float, float]:
+        """(lexical, jaccard) blend for this store's retrieval mode."""
+        if self.fts_available:
+            return LEX_WEIGHT, JAC_WEIGHT
+        return FALLBACK_LEX_WEIGHT, FALLBACK_JAC_WEIGHT
+
     def retrieve(self, query: str, repo: Path | None = None, limit: int = 64) -> list[dict]:
-        """Ranked memories: (0.65*lexical + 0.35*trigram-Jaccard) * trust * decay.
+        """Ranked memories: lexical(BM25) * trust * decay (Jaccard re-rank only
+        on the FTS-less fallback — see the weight constants for the evidence).
         Quarantined and superseded rows never surface; unverified (repo-sourced,
         unpromoted) notes are down-weighted so they can't outrank trusted canon."""
         banks = ("global",) if repo is None else ("global", self.bank_of(repo))
         with self._lock:
             cands = self._candidates(query, banks, limit)
             stats = self._stats_map([c["key"] for c in cands])
-        qgrams = _trigrams(query)
+        lex_w, jac_w = self._weights()
+        qgrams = _trigrams(query) if jac_w else set()
         out = []
         for c in cands:
             s = stats.get(c["key"])
             if s is not None and s[4]:
                 continue  # quarantined
             trust = self._trust((s[1], s[2], s[3]) if s else None)
-            jac = _jaccard(qgrams, _trigrams(c["title"] + " " + c["keywords"] + " " + c["tags"]))
+            jac = _jaccard(qgrams, _trigrams(
+                c["title"] + " " + c["keywords"] + " " + c["tags"])) if jac_w else 0.0
             cred_w = 1.0 if c.get("credibility", "operator") == "operator" else UNVERIFIED_WEIGHT
             c["trust"] = trust
-            c["score"] = (0.65 * c["lex"] + 0.35 * jac) * trust * cred_w \
+            c["score"] = (lex_w * c["lex"] + jac_w * jac) * trust * cred_w \
                 * self._decay(c["kind"], c["valid_at"])
             out.append(c)
         # Credibility tier FIRST, score second: a down-weight alone cannot
@@ -1573,12 +1660,14 @@ class Mneme:
             stats = self._stats_map([c["key"] for c in cands])
         qg = _trigrams(q)
         out = []
+        lex_w, jac_w = self._weights()
         for c in cands:
             srow = stats.get(c["key"])
             if srow is not None and srow[4]:
                 continue
             trust = self._trust((srow[1], srow[2], srow[3]) if srow else None)
-            jacc = _jaccard(qg, _trigrams(c["title"] + " " + c["keywords"] + " " + c["tags"]))
+            jacc = _jaccard(qg, _trigrams(
+                c["title"] + " " + c["keywords"] + " " + c["tags"])) if jac_w else 0.0
             decay = self._decay(c["kind"], c["valid_at"])
             cred = c.get("credibility", "operator")
             cred_w = 1.0 if cred == "operator" else UNVERIFIED_WEIGHT
@@ -1586,7 +1675,7 @@ class Mneme:
                         "lexical": round(c["lex"], 3), "jaccard": round(jacc, 3),
                         "trust": round(trust, 3), "decay": round(decay, 3),
                         "credibility": cred,
-                        "score": round((0.65 * c["lex"] + 0.35 * jacc)
+                        "score": round((lex_w * c["lex"] + jac_w * jacc)
                                        * trust * cred_w * decay, 4)})
         out.sort(key=lambda x: -x["score"])
         return out[:top_k]
