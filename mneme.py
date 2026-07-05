@@ -753,8 +753,25 @@ class Mneme:
             return None
         path.write_text(render_note(kind, title, body, keywords=keywords, tags=tags,
                                     pinned=pinned, supersedes=supersedes), encoding="utf-8")
-        self.reindex(repo)
+        self._index_note_file(path, self.bank_of(repo))
         return path
+
+    def _index_note_file(self, path: Path, bank: str) -> None:
+        """Index exactly ONE canon note file. add_note knows precisely what it
+        wrote — a full reindex per add rescans every file and re-runs the
+        supersession pass, which made bulk seeding quadratic (the 2000-entry
+        scale bench timed out at 10 minutes). External edits still use
+        reindex(); this is the O(1) path for programmatic writes."""
+        n = parse_note(Path(path))
+        if n is None:
+            return
+        key = self._file_key(n.path)
+        with self._lock:
+            self._upsert_locked(key, n.kind, bank, n.title, n.body, n.keywords,
+                                n.tags, str(n.path), n.pinned, n.mtime, n.valid_at)
+            if n.supersedes:
+                self._supersede_locked(key, n.supersedes)
+            self._conn.commit()
 
 # ---------------------------------------------------------------------------
 # CLI: python mneme.py <cmd> [...] — MNEME_DIR env or --dir sets the home.
