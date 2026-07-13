@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+# ADR-0004 embedding encoder artifacts (23MB binary, provisioned locally — never committed)
+models/
 mneme-data/
 demo/
 .pytest_cache/

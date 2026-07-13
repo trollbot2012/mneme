@@ -378,6 +378,22 @@ TARGETS = _PARAPHRASE_TARGETS + ZERO_OVERLAP_TARGETS
 KEYWORD_QUERIES = [(t, b, t) for t, b, _ in TARGETS]
 
 
+# --- ADR-0004 gate-3 baseline (pre-implementation, DO NOT re-derive) ----------
+# Measured on the PRE-ADR engine — mneme.py sha256
+# 98df68f5599bed646984571463a786892f57a568514c4292b3842cea08103d40 (engine head
+# 2c3e1df, the ADR-doc-only commit) — with C:\Python314\python.exe at scale 1000
+# on THIS widened 110-query fixture under the unified exact-title is_hit rule.
+# Identical p@3 values reproduced at scale 2000 and across repeat runs.
+# Gate 3's +0.10 uplift and the keyword non-regression are defined against
+# THESE constants, never against re-runs; the historical 0.56-0.60 figures
+# (25-query fixture, 40-char-substring rule) are explicitly NOT the baseline.
+BASELINE_P3_OVERALL = 0.400        # 44/110
+BASELINE_P3_PARAPHRASE = 0.550     # 44/80
+BASELINE_P3_ZERO_OVERLAP = 0.000   # 0/30 — lexical retrieval cannot reach these
+BASELINE_P3_KEYWORD = 1.000        # 110/110 (query == title)
+BASELINE_P50_MS = 0.51             # recall p50 at scale 1000 (0.46-0.61 across runs)
+
+
 def is_hit(target_title: str, hit_titles) -> bool:
     """THE match rule for every p@3 number (scale_bench, engine_gate, tests).
 
@@ -424,10 +440,10 @@ class Provider:
 class MnemeProvider(Provider):
     name = "mneme"
 
-    def __init__(self):
+    def __init__(self, cfg: dict | None = None):
         from mneme import Mneme
         self.dir = Path(tempfile.mkdtemp(prefix="scale-mneme-"))
-        self.mem = Mneme(self.dir / "m.db", self.dir / "notes")
+        self.mem = Mneme(self.dir / "m.db", self.dir / "notes", config=cfg or None)
 
     def seed(self, entries):
         for title, body in entries:
@@ -451,15 +467,25 @@ def run(provider_cls, scale):
         t0 = time.perf_counter()
         p.seed(corpus)
         seed_ms = (time.perf_counter() - t0) * 1000
+        n_para = len(_PARAPHRASE_TARGETS)
         hits, lats = 0, []
-        for title, _body, query in TARGETS:
+        class_hits = [0, 0]  # [paraphrase, zero-overlap] by fixture index split
+        for idx, (title, _body, query) in enumerate(TARGETS):
             t0 = time.perf_counter()
             top3 = p.query(query)
             lats.append((time.perf_counter() - t0) * 1000)
             if is_hit(title, top3):
                 hits += 1
+                class_hits[0 if idx < n_para else 1] += 1
+        # keyword-identical class (gate-3 non-regression probe): hit rate only,
+        # its latencies stay OUT of p50 so p50 keeps meaning "fixture queries"
+        kw_hits = sum(1 for title, _body, query in KEYWORD_QUERIES
+                      if is_hit(title, p.query(query)))
         return {"scale": scale, "seed_ms": round(seed_ms, 1),
                 "p_at_3": round(hits / len(TARGETS), 3),
+                "p3_paraphrase": round(class_hits[0] / n_para, 3),
+                "p3_zero_overlap": round(class_hits[1] / len(ZERO_OVERLAP_TARGETS), 3),
+                "p3_keyword": round(kw_hits / len(KEYWORD_QUERIES), 3),
                 "lat_p50_ms": round(statistics.median(lats), 2),
                 "lat_max_ms": round(max(lats), 2)}
     finally:
@@ -468,16 +494,150 @@ def run(provider_cls, scale):
 
 TARGETS_TITLES_BODIES = [(t, b) for t, b, _q in TARGETS]
 
+
+# --- ADR-0004 gate-4 assert mode ----------------------------------------------
+ASSERT_SCALE = 1000
+ASSERT_P50_OFF_MS = 2.0   # gate 4 budget, embeddings off (baseline p50 well under)
+ASSERT_P50_ON_MS = 20.0   # gate 4 budget, embeddings on (cold load excluded)
+MODEL_FILES = ("model_quint8_avx2.onnx", "vocab.txt")
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+
+
+def _encode_calls(mem) -> int:
+    """Read the PER-TEXT encode counter.
+
+    WP3 contract: the lazily-built encoder lives at Mneme._encoder and its
+    encode() does `self.calls += len(texts)` — texts, not batches, so a
+    per-candidate encode smuggled into one batch call still moves the counter.
+    Returns 0 when the engine predates ADR-0004 or the encoder is not loaded.
+    """
+    return int(getattr(getattr(mem, "_encoder", None), "calls", 0) or 0)
+
+
+def _assert_arm(label, cfg, p50_budget_ms, encode_guard):
+    """One --assert arm at ASSERT_SCALE. Returns a list of failure strings.
+
+    All embeddings hooks are hasattr/getattr-guarded so the off-arm (and the
+    whole command) runs against the pre-ADR engine today; once the engine
+    grows `embeddings_available`, a False value with model files present is a
+    LOUD failure, never a silent lexical-only pass.
+    """
+    failures = []
+    p = MnemeProvider(cfg=cfg)
+    try:
+        corpus = list(TARGETS_TITLES_BODIES) + distractors(
+            max(0, ASSERT_SCALE - len(TARGETS)))
+        p.seed(corpus)
+        mem = p.mem
+        pre_adr = not hasattr(mem, "embeddings_available")
+        if encode_guard:
+            if hasattr(mem, "_sync_vectors"):
+                while mem._sync_vectors():
+                    pass
+            if pre_adr:
+                print(f"  [{label}] NOTE: engine predates ADR-0004 "
+                      f"(no embeddings hooks); arm ran lexical-only")
+            elif not mem.embeddings_available:
+                failures.append(
+                    f"[{label}] embeddings_available is False with model files "
+                    f"present — the on-arm silently degraded to lexical-only")
+            # one warmup recall: cold encoder load is paid (and printed) here,
+            # never inside the p50 window
+            t0 = time.perf_counter()
+            p.query(TARGETS[0][2])
+            print(f"  [{label}] warmup recall (cold load, excluded from p50): "
+                  f"{(time.perf_counter() - t0) * 1000:.1f}ms")
+        hits, lats = 0, []
+        for title, _body, query in TARGETS:
+            c0 = _encode_calls(mem)
+            t0 = time.perf_counter()
+            top3 = p.query(query)
+            lats.append((time.perf_counter() - t0) * 1000)
+            c1 = _encode_calls(mem)
+            if is_hit(title, top3):
+                hits += 1
+            if encode_guard and not pre_adr:
+                if c1 - c0 > 1:
+                    failures.append(
+                        f"[{label}] encode guard: {c1 - c0} texts encoded in one "
+                        f"recall ({query!r}) — per-candidate encoding")
+                p.query(query)  # immediately repeated: must hit the query-vec LRU
+                c2 = _encode_calls(mem)
+                if c2 != c1:
+                    failures.append(
+                        f"[{label}] LRU guard: repeated query {query!r} "
+                        f"re-encoded ({c2 - c1} texts)")
+        if encode_guard and not pre_adr and _encode_calls(mem) == 0:
+            failures.append(
+                f"[{label}] per-text counter never moved across "
+                f"{len(TARGETS)} recalls — WP3 counter contract "
+                f"(Mneme._encoder.calls) is broken, guards were vacuous")
+        p50 = statistics.median(lats)
+        print(f"  [{label}] scale={ASSERT_SCALE} p@3={hits / len(TARGETS):.3f} "
+              f"p50={p50:.2f}ms max={max(lats):.2f}ms (budget {p50_budget_ms}ms)")
+        if p50 > p50_budget_ms:
+            failures.append(
+                f"[{label}] lat_p50_ms {p50:.2f} > budget {p50_budget_ms}")
+        return failures
+    finally:
+        p.close()
+
+
+def run_assert(model_dir: Path) -> int:
+    """Gate-4 battery (ADR-0004): returns nonzero on ANY breach.
+
+    Two arms at scale 1000: embeddings-off (p50 <= 2ms), then embeddings-on
+    (p50 <= 20ms after a full `_sync_vectors` fill and one warmup recall)
+    with the per-TEXT encode guard: <=1 encode per recall, exactly 0 on an
+    immediately repeated query (LRU proof). Missing model files fail LOUD —
+    a gate runner must never silently skip the on-arm.
+    """
+    missing = [str(model_dir / f) for f in MODEL_FILES
+               if not (model_dir / f).is_file()]
+    if missing:
+        print("ASSERT FAIL: embedding model files absent — the embeddings-on "
+              "arm cannot run, and skipping it silently would void gate 4:")
+        for m in missing:
+            print(f"  missing: {m}")
+        print("Provision via scripts/provision_embeddings.ps1 (or .sh), "
+              "or pass --model-dir.")
+        return 1
+    print(f"--assert: gate-4 latency + encode-guard battery at scale {ASSERT_SCALE}")
+    failures = _assert_arm("embeddings-off", {"embeddings": "off"},
+                           ASSERT_P50_OFF_MS, encode_guard=False)
+    failures += _assert_arm(
+        "embeddings-on",
+        {"embeddings": "auto", "embed_model_dir": str(model_dir)},
+        ASSERT_P50_ON_MS, encode_guard=True)
+    if failures:
+        print("ASSERT FAIL:")
+        for f in failures:
+            print(f"  {f}")
+        return 1
+    print("ASSERT OK: all gate-4 budgets and encode guards held")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default="mneme", choices=sorted(PROVIDERS))
     ap.add_argument("--scales", nargs="*", type=int, default=[20, 100, 500, 1000, 2000])
+    ap.add_argument("--assert", dest="assert_mode", action="store_true",
+                    help="gate-4 mode: run the two-arm latency + encode-guard "
+                         "battery at scale 1000 and exit 1 on any breach "
+                         "(plain runs stay print-only)")
+    ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
+                    help=f"embedding model directory (default {DEFAULT_MODEL_DIR})")
     args = ap.parse_args()
+    if args.assert_mode:
+        sys.exit(run_assert(args.model_dir))
     print(f"provider={args.provider} | {len(TARGETS)} target queries "
           f"({len(_PARAPHRASE_TARGETS)} paraphrase + {len(ZERO_OVERLAP_TARGETS)} "
           f"zero-overlap), precision@3 under distractor noise")
-    print(f"{'scale':>6} {'seed_ms':>9} {'p@3':>6} {'p50_ms':>8} {'max_ms':>8}")
+    print(f"{'scale':>6} {'seed_ms':>9} {'p@3':>6} {'para':>6} {'zero':>6} "
+          f"{'kw':>6} {'p50_ms':>8} {'max_ms':>8}")
     for s in args.scales:
         r = run(PROVIDERS[args.provider], s)
         print(f"{r['scale']:>6} {r['seed_ms']:>9} {r['p_at_3']:>6} "
-              f"{r['lat_p50_ms']:>8} {r['lat_max_ms']:>8}")
+              f"{r['p3_paraphrase']:>6} {r['p3_zero_overlap']:>6} "
+              f"{r['p3_keyword']:>6} {r['lat_p50_ms']:>8} {r['lat_max_ms']:>8}")
