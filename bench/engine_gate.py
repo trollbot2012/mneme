@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mneme import Mneme  # noqa: E402
-from scale_bench import TARGETS, distractors  # noqa: E402
+from scale_bench import TARGETS, distractors, is_hit  # noqa: E402
 
 
 def build(scale, **cfg):
@@ -44,13 +44,13 @@ def run(mem):
         t0 = time.perf_counter()
         top = mem.recall(query, top_k=3)
         lat.append((time.perf_counter() - t0) * 1000)
-        if any(h["title"] == title for h in top):
+        if is_hit(title, [h["title"] for h in top]):  # ONE match rule (scale_bench.is_hit)
             hits3 += 1
     return hits3 / len(TARGETS), statistics.median(lat)
 
 
 def main():
-    print(f"{len(TARGETS)} paraphrased queries | engine-level p@3 (real Mneme.recall)")
+    print(f"{len(TARGETS)} fixture queries | engine-level p@3 (real Mneme.recall)")
     print(f"{'config':<28} {'n=1000':>16} {'n=2000':>16}")
     for label, cfg in (("shipped (no jaccard)", {}),
                        ("df-pruning forced on", {"df_prune_min_rows": 0})):
