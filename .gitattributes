@@ -1,0 +1,3 @@
+# The golden off-path pin (ADR-0004 gate 6) is compared BYTE-identically by
+# bench/capture_golden.py — autocrlf must never rewrite its newlines on checkout.
+bench/golden_off_path.json -text
