@@ -295,11 +295,15 @@ DEFAULTS = {
     # demanded — the fts_available spirit); 'off' forces lexical-only. There is
     # deliberately no forcing 'on': a missing model degrades silently.
     "embeddings": "auto",
-    # Semantic blend weight. 0.0 is the NEUTRAL placeholder: every deployed
-    # state of the engine change is arithmetically inert by default. The fitted
-    # value lands as its own commit citing the committed w_sem grid
-    # (PROOF-ADR-0004) — fitted, never hand-picked (the 0.65/0.35 lesson).
-    "w_sem": 0.0,
+    # Semantic blend weight — FITTED, never hand-picked (the 0.65/0.35
+    # lesson). Selected by the pre-registered rule in bench/engine_gate.py
+    # --wsem-grid (maximize paraphrase p@3 subject to keyword-identical p@3 >=
+    # baseline 1.000; ties -> smaller w_sem, then clip_abs) over the 2x8 grid
+    # run 2026-07-13 on C:\Python314\python.exe, onnxruntime 1.26.0, engine at
+    # commit B: winner minmax/w_sem=0.6 -> p@3 0.600, paraphrase 0.662,
+    # zero-overlap 0.433, keyword 1.000 (baseline 0.400/0.550/0.000/1.000).
+    # Full table verbatim in PROOF-ADR-0004.md.
+    "w_sem": 0.6,
     # '' resolves to db_path.parent / 'models' at init (hosts pass their own).
     "embed_model_dir": "",
     # Cosine-only candidates appended per recall (the UNION leg). 0 disables
@@ -361,14 +365,19 @@ EMBED_BATCH = 32             # texts per ONNX run inside one encode() call
 # PROOF-ADR-0004 publishes any first-backfill number.
 EMBED_BACKFILL_BATCH = 128
 ENCODER_ID = "all-MiniLM-L6-v2-quint8-avx2-rev1110a243-s256"
-# Semantic-score normalization for the union leg. SHIPPED value is 'clip_abs'
-# (absolute clamped cosine): cosine similarity of L2-normalized MiniLM vectors
-# is already a calibrated absolute signal, and a per-set min-max would let one
-# weak candidate set inflate its best member to 1.0 (relative rank laundered
-# into absolute confidence). The alternative is MEASURED, not hand-asserted:
-# the w_sem grid (bench/engine_gate.py --wsem-grid) monkeypatches this to
-# 'minmax' for its comparison rows — nothing outside that harness may set it.
-_SEM_NORM = "clip_abs"
+# Semantic-score normalization for the union leg: per-recall MIN-MAX over the
+# candidates that carry a cosine. This was decided by MEASUREMENT, not by the
+# (plausible-sounding) hand argument: the pre-ADR draft asserted 'clip_abs'
+# (absolute clamped cosine) on the theory that min-max launders relative rank
+# into absolute confidence — but the pre-registered 2x8 w_sem grid
+# (bench/engine_gate.py --wsem-grid, 2026-07-13, C:\Python314 onnxruntime
+# 1.26.0, table in PROOF-ADR-0004.md) measured minmax strictly better at every
+# w_sem >= 0.2 (best paraphrase 0.662 vs clip_abs 0.625) with the
+# keyword-identical class never regressing, so the losing clip_abs branch was
+# removed with that grid as evidence (the 0.65/0.35 lesson: constants and
+# branches are fitted, never argued into place). The former module switch
+# `_SEM_NORM` is gone with it; the grid harness detects its absence and sweeps
+# only the shipped norm.
 
 
 def _vec_content_hash(title: str, body: str, keywords: str) -> str:
@@ -1456,23 +1465,19 @@ class Mneme:
                                         "pinned": bool(h[7]), "valid_at": h[8],
                                         "credibility": h[9], "lex": 0.0,
                                         "sem": sim})
-            # Normalization: 'clip_abs' ships (cosine on L2-normalized MiniLM
-            # vectors is an absolute, comparable signal); per-set min-max is
-            # rejected by default because it inflates the best of a WEAK set
-            # to 1.0 — but it is MEASURED, not hand-asserted: the w_sem grid
-            # harness monkeypatches _SEM_NORM to compare both.
-            if _SEM_NORM == "minmax":
-                sems = [c["sem"] for c in out if "sem" in c]
-                if sems:
-                    s_lo, s_hi = min(sems), max(sems)
-                    s_span = (s_hi - s_lo) or 1.0
-                    for c in out:
-                        if "sem" in c:
-                            c["sem"] = (c["sem"] - s_lo) / s_span
-            else:
+            # Normalization: per-recall min-max over the sem-carrying
+            # candidates — the MEASURED winner of the 2x8 w_sem grid (see the
+            # comment above ENCODER_ID; clip_abs, the hand-argued draft
+            # choice, lost at every w_sem >= 0.2 and its branch was removed
+            # with the grid as evidence). A single-candidate set spans 0 and
+            # scores sem=0.0 — exactly the behavior the grid measured.
+            sems = [c["sem"] for c in out if "sem" in c]
+            if sems:
+                s_lo, s_hi = min(sems), max(sems)
+                s_span = (s_hi - s_lo) or 1.0
                 for c in out:
                     if "sem" in c:
-                        c["sem"] = max(0.0, c["sem"])
+                        c["sem"] = (c["sem"] - s_lo) / s_span
         return out
 
     def _weights(self) -> tuple[float, float, float]:

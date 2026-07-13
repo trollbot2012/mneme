@@ -1,8 +1,21 @@
 # ADR 0004 — Optional embedding rerank (UNION-then-rerank)
 
-Status: **PROPOSED — decision document only, build deferred** (operator
-directive 2026-07-05: Phase 0 safety first; semantic rerank decided behind an
-ADR, not built yet). Revisits ADR 0003 (stdlib-only bundle).
+Status: **ACCEPTED — 2026-07-13, all six gates green** (evidence:
+[PROOF-ADR-0004.md](../PROOF-ADR-0004.md) — commit-A baseline, fitted
+`w_sem = 0.6` via the pre-registered grid rule on the deployment interpreter,
+per-gate commands and outputs). Originally PROPOSED 2026-07-05 as a decision
+document with build deferred (Phase 0 safety first). Revisits ADR 0003
+(stdlib-only bundle).
+
+Implementation notes vs. the proposal: `mem_vec` is keyed by `dedupe_key`
+(mirroring `mem_fts`) rather than `note_id`; encoding happens in
+`_sync_vectors` sweeps (write paths only maintain the never-stale invariant
+via an unconditional content-hash check, so wheel-absent writers stay
+correct) rather than inline in `_upsert_locked`; co-occurrence expansion is
+gated off whenever a query vector is present (conditionally dead, not yet
+deleted). The semantic score is per-recall min-max normalized — fitted, like
+`w_sem` itself, by the committed 2×8 grid (the hand-argued clip-abs
+alternative measured strictly worse and its branch was removed).
 
 ## Context
 
