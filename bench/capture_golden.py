@@ -110,6 +110,19 @@ def main():
             print(f"OK: byte-identical reproduction of {OUT.name} "
                   f"({len(old)} bytes, {sum(len(r['hits']) for r in json.loads(old)['recalls'])} pinned hits)")
             return 0
+        # The engine_mneme_sha256 field names the CURRENT mneme.py by
+        # construction, so it diverges on every legitimate engine commit.
+        # Gate 6 pins BEHAVIOR: compare modulo that one provenance field
+        # (exactly what test_adr0004.py's golden test does) and report
+        # provenance drift separately instead of a false MISMATCH.
+        old_doc, new_doc = json.loads(old), json.loads(text)
+        old_sha = old_doc.pop("engine_mneme_sha256", None)
+        new_sha = new_doc.pop("engine_mneme_sha256", None)
+        if old_doc == new_doc:
+            print(f"OK: behaviorally identical to {OUT.name} "
+                  f"(engine provenance drifted as expected: pinned at "
+                  f"{str(old_sha)[:12]}, current {str(new_sha)[:12]})")
+            return 0
         print(f"MISMATCH: engine output diverges from {OUT.name}; "
               f"off-path behavior changed (gate 6). Use --write ONLY to rebaseline.")
         return 1

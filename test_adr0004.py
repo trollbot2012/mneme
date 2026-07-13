@@ -429,6 +429,58 @@ def test_zero_encodes_heal_after_edit_while_embeddings_off(tmp_path):
 
 
 @EMBED
+def test_sync_fast_path_not_masked_by_orphan_vectors(tmp_path):
+    """Adversarial-verify finding (2026-07-13): an orphan vector (left by
+    supersession, or by a pre-ADR writer in a mixed-version window) must not
+    mask a live row that lacks a vector. With a raw mem_vec count the totals
+    tie (live=10, vectors=9+1 orphan), the fast path reports embedded=0
+    forever, and stats coverage claims 1.0 in exactly the state where the
+    drift-visibility promise matters. The live-row join unmasks both."""
+    mem, _paths = _seed_files(tmp_path, 9)
+    try:
+        assert _calls(mem) == 9
+    finally:
+        mem.close()
+    off = Mneme(tmp_path / "m.db", tmp_path / "notes",
+                config={"embeddings": "off", "embed_model_dir": str(MODELS_DIR)})
+    try:
+        # Orphan: invalidate one row the way supersession does — mem row
+        # goes invalid, its vector stays behind until a sweep.
+        with off._lock:
+            victim = off._conn.execute(
+                "SELECT dedupe_key FROM mem WHERE invalid_at IS NULL"
+                " LIMIT 1").fetchone()[0]
+            off._conn.execute(
+                "UPDATE mem SET invalid_at=? WHERE dedupe_key=?",
+                (time.time(), victim))
+            off._conn.commit()
+        # Missing: a note authored while embeddings are off — live row,
+        # no vector. Totals now tie: 9 live rows, 9 vectors (8 live + 1 orphan).
+        off.add_note("fact", "Gauge 11 calibration note",
+                     f"The gauge 11 calibrates against the "
+                     f"{_GAUGE_WORDS[11]} reference cell unique-11.")
+    finally:
+        off.close()
+    m2 = Mneme(tmp_path / "m.db", tmp_path / "notes",
+               config={"embed_model_dir": str(MODELS_DIR)})
+    try:
+        assert _calls(m2) == 0
+        res = m2.reindex()  # files unchanged: COUNT fast path
+        assert res["embedded"] == 1, \
+            "orphan vector masked the missing one — fast path unsound"
+        assert _calls(m2) == 1
+        emb = m2.stats()["embeddings"]
+        assert emb["vectors"] == 9, "orphan still counted after sweep"
+        assert emb["coverage"] == 1.0
+        with m2._lock:
+            assert m2._conn.execute(
+                "SELECT COUNT(*) FROM mem_vec WHERE dedupe_key=?",
+                (victim,)).fetchone()[0] == 0, "orphan vector not swept"
+    finally:
+        m2.close()
+
+
+@EMBED
 def test_zero_encodes_disposability_delete_db_rebuilds_vectors(tmp_path):
     """Delete-the-db roundtrip: mem_vec is as disposable as the rest of the
     index — vectors rebuild from canon files alone."""

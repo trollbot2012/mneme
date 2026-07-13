@@ -1147,10 +1147,14 @@ class Mneme:
         EMBED_BACKFILL_BATCH so a first backfill never stalls one caller.
 
         FAST PATH (dirty=False, i.e. an unchanged reindex): compare
-        COUNT(live non-episode mem) with COUNT(mem_vec WHERE encoder=current).
-        Sound because _upsert_locked/_delete_locked run their mem_vec
-        hash-delete UNCONDITIONALLY in every writer — a stale row cannot
-        exist, so equal counts mean no missing vectors under this encoder.
+        COUNT(live non-episode mem) with COUNT(mem_vec joined to a live
+        non-episode row, encoder=current). The join is load-bearing: a raw
+        mem_vec count would let an ORPHAN vector (supersession leaves one
+        until the next sweep) mask a live row that is missing its vector —
+        equal totals, permanent coverage hole (adversarial-verify finding,
+        2026-07-13). Stale rows still cannot exist (_upsert_locked/
+        _delete_locked hash-delete unconditionally), so with orphans
+        excluded, equal counts do mean no missing vectors.
 
         LOCK DISCIPLINE: candidate/orphan selection under a brief lock,
         ENCODE WITH NO LOCK HELD (a model run must never serialize writers),
@@ -1167,7 +1171,10 @@ class Mneme:
                     "SELECT COUNT(*) FROM mem"
                     " WHERE kind != 'episode' AND invalid_at IS NULL").fetchone()[0]
                 have = self._conn.execute(
-                    "SELECT COUNT(*) FROM mem_vec WHERE encoder = ?",
+                    "SELECT COUNT(*) FROM mem_vec v JOIN mem m"
+                    " ON m.dedupe_key = v.dedupe_key"
+                    " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                    " WHERE v.encoder = ?",
                     (ENCODER_ID,)).fetchone()[0]
                 if live == have:
                     return 0
@@ -2044,9 +2051,14 @@ class Mneme:
                 " ORDER BY s.served DESC LIMIT 10").fetchall()
             # ADR-0004 operator legibility: partial-backfill drift is visible,
             # not silent — a host's stats dump shows exactly how much of the
-            # live store carries a current-encoder vector.
+            # live store carries a current-encoder vector. Joined to live
+            # rows so orphan vectors can't inflate coverage to 1.0 in the
+            # exact state where visibility matters (verify finding 2026-07-13).
             vectors = self._conn.execute(
-                "SELECT COUNT(*) FROM mem_vec WHERE encoder = ?",
+                "SELECT COUNT(*) FROM mem_vec v JOIN mem m"
+                " ON m.dedupe_key = v.dedupe_key"
+                " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                " WHERE v.encoder = ?",
                 (ENCODER_ID,)).fetchone()[0]
             live_ne = self._conn.execute(
                 "SELECT COUNT(*) FROM mem"
