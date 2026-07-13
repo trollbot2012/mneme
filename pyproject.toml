@@ -6,5 +6,11 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = []
 
+[project.optional-dependencies]
+# ADR-0004: optional semantic recall. The ONE optional wheel — model files are
+# provisioned separately by scripts/provision_embeddings.{ps1,sh} (the library
+# itself ships zero network code). Without both, Mneme stays lexical-only.
+embeddings = ["onnxruntime>=1.20"]
+
 [project.scripts]
 mneme = "mneme:_cli"

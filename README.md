@@ -167,6 +167,13 @@ python mneme.py --dir ./mneme-data export [--out snapshot.md] | import snapshot.
 Python 3.11+. Nothing else. (FTS5 ships in standard CPython builds; a LIKE+Jaccard
 fallback engages automatically where it doesn't.)
 
+## Optional: semantic recall (ADR-0004)
+
+Paraphrase-robust recall via a local MiniLM ONNX encoder — opt-in, and the core stays zero-dependency.
+Provision the sha256-pinned model files (~23MB; the library itself never downloads anything): `scripts/provision_embeddings.ps1` (Windows) or `scripts/provision_embeddings.sh` (POSIX).
+Install the one optional wheel: `pip install "onnxruntime>=1.20"` (or `pip install "mneme-memory[embeddings]"`).
+With both present (`models/` next to the store's db, or the `embed_model_dir` config key), embeddings activate automatically; remove either and Mneme degrades silently to lexical-only.
+
 ## Provenance
 
 Extracted verbatim from the memory layer of **Ktisis**, a proof-gated coding agent —

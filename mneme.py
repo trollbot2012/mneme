@@ -241,6 +241,18 @@ CREATE TABLE IF NOT EXISTS run_outcome (
     status TEXT NOT NULL,
     ts REAL NOT NULL
 );
+-- ADR-0004: vector mirror of live notes, keyed by dedupe_key exactly like
+-- mem_fts. A PLAIN table inside _SCHEMA (not _FTS_SCHEMA's try/except): the
+-- executescript at init migrates existing DBs for free. Gate-6 reading:
+-- off-path byte-identity is BEHAVIORAL (golden off-path pin + suite green
+-- wheel-absent) — an empty mem_vec table on the embeddings-off path is inert.
+CREATE TABLE IF NOT EXISTS mem_vec (
+    dedupe_key TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    encoder TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vec BLOB NOT NULL
+);
 """
 
 _FTS_SCHEMA = """
@@ -278,6 +290,22 @@ DEFAULTS = {
     # lower this to prove p@3 is unchanged with pruning active). Mirrors
     # DF_PRUNE_MIN_ROWS below (defined after this dict).
     "df_prune_min_rows": 2000,
+    # -- ADR-0004: optional embedding rerank -----------------------------------
+    # 'auto' activates iff both model files exist (capability detected, never
+    # demanded — the fts_available spirit); 'off' forces lexical-only. There is
+    # deliberately no forcing 'on': a missing model degrades silently.
+    "embeddings": "auto",
+    # Semantic blend weight. 0.0 is the NEUTRAL placeholder: every deployed
+    # state of the engine change is arithmetically inert by default. The fitted
+    # value lands as its own commit citing the committed w_sem grid
+    # (PROOF-ADR-0004) — fitted, never hand-picked (the 0.65/0.35 lesson).
+    "w_sem": 0.0,
+    # '' resolves to db_path.parent / 'models' at init (hosts pass their own).
+    "embed_model_dir": "",
+    # Cosine-only candidates appended per recall (the UNION leg). 0 disables
+    # the union and leaves pure rerank-of-BM25-candidates — the ADR's rejected
+    # variant, kept expressible as a plain config row (gate 2's comparator).
+    "embed_top_n": 16,
 }
 
 # Episodes may exceed max_episodes by this slack before an automatic compact
@@ -319,6 +347,39 @@ DF_PRUNE_MIN_ROWS = 2000
 DF_PRUNE_RATIO = 0.10
 DF_PRUNE_KEEP_MIN = 3
 
+# --- ADR-0004: embedding constants -------------------------------------------
+# Model files provisioned by scripts/provision_embeddings.{ps1,sh} — the
+# library itself ships ZERO network code and never downloads anything.
+EMBED_MODEL_FILES = ("model_quint8_avx2.onnx", "vocab.txt")
+# Hard wordpiece-token cap per embedded text INCLUDING [CLS]/[SEP]. The
+# truncation policy is baked into ENCODER_ID: changing either invalidates
+# every stored vector (the encoder column mismatch triggers re-encode).
+EMBED_SEQ_LEN = 256
+EMBED_BATCH = 32             # texts per ONNX run inside one encode() call
+# Rows per _sync_vectors pass. Conservative start — the per-batch stall is
+# re-MEASURED on the deployment interpreter (C:\Python314) before
+# PROOF-ADR-0004 publishes any first-backfill number.
+EMBED_BACKFILL_BATCH = 128
+ENCODER_ID = "all-MiniLM-L6-v2-quint8-avx2-rev1110a243-s256"
+# Semantic-score normalization for the union leg. SHIPPED value is 'clip_abs'
+# (absolute clamped cosine): cosine similarity of L2-normalized MiniLM vectors
+# is already a calibrated absolute signal, and a per-set min-max would let one
+# weak candidate set inflate its best member to 1.0 (relative rank laundered
+# into absolute confidence). The alternative is MEASURED, not hand-asserted:
+# the w_sem grid (bench/engine_gate.py --wsem-grid) monkeypatches this to
+# 'minmax' for its comparison rows — nothing outside that harness may set it.
+_SEM_NORM = "clip_abs"
+
+
+def _vec_content_hash(title: str, body: str, keywords: str) -> str:
+    """Content identity for a stored vector (mem_vec.content_hash). NUL
+    separators keep the triple injective — ('a','b','') and ('a','','b') must
+    not collide. Stdlib sha256 on purpose: EVERY writer in the fleet, wheel-
+    absent ones included, can maintain the never-stale invariant for
+    microseconds per upsert."""
+    payload = "\x00".join((title, body, keywords))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
 _UNVERIFIED_HEADER = "Unverified notes suggested by this repo (verify before trusting):"
 _UNVERIFIED_MAX_LINES = 3
 
@@ -343,6 +404,164 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+# --- ADR-0004: optional embedding encoder -------------------------------------
+# onnxruntime and numpy are imported ONLY inside _MiniLMEncoder methods: the
+# Hermes plugin loader eagerly execs plugin *.py up to 3x per process, and a
+# module-level import of an optional wheel would kill ALL memory on hosts that
+# don't have it. mneme.py stays importable with nothing but the stdlib.
+
+class _MiniLMEncoder:
+    """all-MiniLM-L6-v2 (quint8 avx2 ONNX export) behind a stdlib tokenizer.
+
+    TRUNCATION POLICY (part of ENCODER_ID — changing it means re-encoding the
+    store): the embed text for a note is title + '\\n' + keywords + '\\n' + body,
+    hard-truncated to EMBED_SEQ_LEN (256) wordpiece tokens INCLUDING the
+    [CLS]/[SEP] specials, so the high-signal fields (title, keywords) always
+    survive truncation and only long bodies lose their tail.
+
+    Tokenization re-implements BERT-uncased on the stdlib: BasicTokenizer
+    (NFD lowercase, accent strip, punctuation/CJK isolation) + greedy
+    longest-match WordPiece over vocab.txt. Vectors are masked mean-pooled
+    over last_hidden_state and L2-normalized float32 ('<f4') rows.
+
+    `calls` counts TEXTS encoded, not encode() invocations (gate-4 encode-guard
+    contract: a per-candidate encode smuggled into one batch call still moves
+    the counter by the number of candidates).
+    """
+
+    def __init__(self, model_dir: Path):
+        import onnxruntime  # lazy: optional wheel (see module comment above)
+        self.calls = 0  # PER-TEXT counter, read by bench/scale_bench.py --assert
+        model_dir = Path(model_dir)
+        self.vocab: dict[str, int] = {}
+        with open(model_dir / "vocab.txt", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                self.vocab[line.rstrip("\n")] = i
+        try:
+            self.cls_id = self.vocab["[CLS]"]
+            self.sep_id = self.vocab["[SEP]"]
+            self.unk_id = self.vocab["[UNK]"]
+        except KeyError as e:  # torn/foreign vocab: fail the build, not recall
+            raise ValueError(f"vocab.txt lacks required special token {e}") from e
+        so = onnxruntime.SessionOptions()
+        so.log_severity_level = 3  # errors only; init chatter stays out of hosts
+        self._sess = onnxruntime.InferenceSession(
+            str(model_dir / "model_quint8_avx2.onnx"),
+            sess_options=so, providers=["CPUExecutionProvider"])
+        # Tensor names are INTROSPECTED, never assumed: a re-export that drops
+        # token_type_ids (or renames an input) must not crash encode().
+        self._input_names = [i.name for i in self._sess.get_inputs()]
+        outs = self._sess.get_outputs()
+        out = next((o for o in outs if o.name == "last_hidden_state"), outs[0])
+        self._output_name = out.name
+        last = out.shape[-1] if out.shape else 0
+        self.dim = int(last) if isinstance(last, int) else 0  # firmed on 1st encode
+
+    @staticmethod
+    def _is_break(ch: str, cat: str) -> bool:
+        """BERT punctuation rule (ASCII symbol ranges + any Unicode P*); CJK
+        ideographs also stand alone (BERT wraps them in spaces)."""
+        cp = ord(ch)
+        if (33 <= cp <= 47) or (58 <= cp <= 64) or (91 <= cp <= 96) or (123 <= cp <= 126):
+            return True
+        if cat.startswith("P"):
+            return True
+        return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                or 0xF900 <= cp <= 0xFAFF or 0x20000 <= cp <= 0x2A6DF)
+
+    def _basic_tokens(self, text: str) -> list[str]:
+        import unicodedata  # stdlib; keeps mneme's top-level import set frozen
+        text = unicodedata.normalize("NFD", text.lower())
+        out: list[str] = []
+        word: list[str] = []
+        for ch in text:
+            cat = unicodedata.category(ch)
+            if cat == "Mn":
+                continue  # strip accents (NFD combining marks)
+            if ch in "\t\n\r" or cat == "Zs" or ch.isspace():
+                if word:
+                    out.append("".join(word))
+                    word = []
+            elif cat in ("Cc", "Cf"):
+                continue  # control chars vanish (BERT _clean_text)
+            elif self._is_break(ch, cat):
+                if word:
+                    out.append("".join(word))
+                    word = []
+                out.append(ch)
+            else:
+                word.append(ch)
+        if word:
+            out.append("".join(word))
+        return out
+
+    def _wordpiece_ids(self, word: str) -> list[int]:
+        if len(word) > 100:
+            return [self.unk_id]  # BERT max_input_chars_per_word
+        ids: list[int] = []
+        start = 0
+        while start < len(word):
+            end = len(word)
+            hit = None
+            while start < end:
+                piece = ("##" if start else "") + word[start:end]
+                tid = self.vocab.get(piece)
+                if tid is not None:
+                    hit = tid
+                    break
+                end -= 1
+            if hit is None:
+                return [self.unk_id]  # any unmatchable span: whole word is [UNK]
+            ids.append(hit)
+            start = end
+        return ids
+
+    def _token_ids(self, text: str) -> list[int]:
+        ids = [self.cls_id]
+        budget = EMBED_SEQ_LEN - 1  # reserve room for [SEP]
+        for word in self._basic_tokens(text):
+            ids.extend(self._wordpiece_ids(word))
+            if len(ids) >= budget:
+                break
+        del ids[budget:]  # hard truncation (policy: see class docstring)
+        ids.append(self.sep_id)
+        return ids
+
+    def encode(self, texts: list[str]):
+        """Encode a batch -> (len(texts), dim) float32 L2-normalized ndarray."""
+        import numpy as np  # lazy: optional wheel
+        self.calls += len(texts)  # PER-TEXT (gate-4 contract), before any work
+        seqs = [self._token_ids(t) for t in texts]
+        chunks = []
+        for i in range(0, len(seqs), EMBED_BATCH):
+            batch = seqs[i:i + EMBED_BATCH]
+            width = max(len(s) for s in batch)
+            input_ids = np.zeros((len(batch), width), dtype=np.int64)
+            attention_mask = np.zeros((len(batch), width), dtype=np.int64)
+            for row, seq in enumerate(batch):
+                input_ids[row, :len(seq)] = seq
+                attention_mask[row, :len(seq)] = 1
+            feeds = {}
+            for name in self._input_names:
+                if name == "input_ids":
+                    feeds[name] = input_ids
+                elif name == "attention_mask":
+                    feeds[name] = attention_mask
+                elif name == "token_type_ids":  # zeros ONLY if the graph declares it
+                    feeds[name] = np.zeros_like(input_ids)
+            (hidden,) = self._sess.run([self._output_name], feeds)
+            mask = attention_mask.astype(np.float32)[:, :, None]
+            pooled = (hidden.astype(np.float32) * mask).sum(axis=1)
+            pooled /= np.maximum(mask.sum(axis=1), 1e-9)
+            pooled /= np.maximum(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12)
+            chunks.append(pooled.astype("<f4"))
+        out = (np.concatenate(chunks) if chunks
+               else np.zeros((0, self.dim or 384), dtype="<f4"))
+        if not self.dim and out.size:
+            self.dim = int(out.shape[1])
+        return out
+
+
 @dataclass
 class IndexBlock:
     text: str = ""
@@ -361,6 +580,17 @@ class Mneme:
         self._bank_cache: dict[str, str] = {}
         self._cooc = None  # lazy co-occurrence expansion table
         self._df_cache: dict[str, int] = {}  # token -> document frequency
+        # -- ADR-0004: optional embeddings (capability detected, never demanded).
+        # Files-only probe with ZERO imports: CLI one-shots and wheel-absent
+        # hosts pay nothing at init. Plain mutable attribute on purpose — tests
+        # force it exactly like fts_available (test_mneme.py monkey-set pattern).
+        self._encoder = None      # lazily built _MiniLMEncoder (_get_encoder)
+        self._qvec_cache = None   # query-vec LRU (OrderedDict), built lazily
+        self._embed_dir = (Path(cfg["embed_model_dir"]) if cfg["embed_model_dir"]
+                           else self.db_path.parent / "models")
+        self.embeddings_available = (
+            str(cfg["embeddings"]).lower() != "off"
+            and all((self._embed_dir / f).is_file() for f in EMBED_MODEL_FILES))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         # RLock: _with_write_retry holds it across attempt AND rollback so a
@@ -655,7 +885,16 @@ class Mneme:
         # _with_write_retry: a lock-timeout mid-scan must roll back rather than
         # leak a half-applied implicit transaction (verify F17); the mtime scan
         # is idempotent so the retry re-runs cleanly.
-        return self._with_write_retry(lambda: self._reindex_locked(roots, force, promoted))
+        res = self._with_write_retry(lambda: self._reindex_locked(roots, force, promoted))
+        # ADR-0004: vector sweep OUTSIDE the reindex lock (encode never holds
+        # it). This IS the automatic existing-DB backfill — the sweep reads mem
+        # directly, so the file-mtime gate above is irrelevant to it. An
+        # unchanged reindex takes the COUNT fast path (dirty=False): two
+        # COUNT(*)s, zero encodes.
+        res["embedded"] = self._sync_vectors(
+            dirty=(res["added"] + res["updated"] + res["pruned"]) > 0)
+        res["embeddings"] = self.embeddings_available
+        return res
 
     def _reindex_locked(self, roots: list, force: bool, promoted: dict) -> dict:
         added = updated = pruned = 0
@@ -740,6 +979,21 @@ class Mneme:
             self._conn.execute(
                 "INSERT INTO mem_fts (dedupe_key, title, body, keywords, tags) VALUES (?,?,?,?,?)",
                 (key, title, body, keywords, tags))
+        # ADR-0004 never-stale invariant. Runs UNCONDITIONALLY — NOT gated on
+        # embeddings_available — so every writer in the fleet (including the
+        # wheel-absent no-onnx CLI) enforces: a mem_vec row either matches this
+        # row's content AND the current encoder, or it is deleted right here.
+        # 'Always current or absent, never stale' is also what makes the COUNT
+        # fast path in _sync_vectors sound: a stale row is a deleted row is a
+        # count mismatch. Cost: one sha256 + one PK SELECT (microseconds). NO
+        # encoding here — the retry closure re-runs and the RLock is held.
+        vrow = self._conn.execute(
+            "SELECT content_hash, encoder FROM mem_vec WHERE dedupe_key=?",
+            (key,)).fetchone()
+        if vrow is not None and (
+                vrow[0] != _vec_content_hash(title, body, keywords)
+                or vrow[1] != ENCODER_ID):
+            self._conn.execute("DELETE FROM mem_vec WHERE dedupe_key=?", (key,))
 
     def _invalidate_cooc(self) -> None:
         self._cooc = None
@@ -753,6 +1007,9 @@ class Mneme:
         self._conn.execute("DELETE FROM mem WHERE dedupe_key=?", (key,))
         if self.fts_available:
             self._conn.execute("DELETE FROM mem_fts WHERE dedupe_key=?", (key,))
+        # ADR-0004: unconditional (see _upsert_locked) — a deleted note leaves
+        # no vector behind, in every writer, wheel or no wheel.
+        self._conn.execute("DELETE FROM mem_vec WHERE dedupe_key=?", (key,))
 
     def _supersede_locked(self, new_key: str, target: str, bank: str, *,
                           sup_pinned: bool = False, sup_cred: str = "operator") -> None:
@@ -815,6 +1072,155 @@ class Mneme:
         if (episode_count > 0 and self.cfg.get("auto_compact", True)
                 and episode_count > int(self.cfg["max_episodes"]) + AUTO_COMPACT_SLACK):
             self.compact()
+
+    # -- ADR-0004: optional embeddings ----------------------------------------
+    def _disable_embeddings(self, why) -> None:
+        """Degrade THIS instance to lexical-only and log ONCE (fts_available
+        doctrine: a broken optional capability must never take retrieval down
+        with it; the flag flip makes every later probe a cheap no-op)."""
+        if not self.embeddings_available:
+            return
+        self.embeddings_available = False
+        try:
+            import logging
+            logging.getLogger("mneme").warning(
+                "embeddings disabled, lexical-only retrieval continues: %s", why)
+        except Exception:
+            pass  # logging must never be the thing that breaks memory
+
+    def _get_encoder(self):
+        """Lazy per-instance encoder. ANY build failure (absent wheel, corrupt
+        model, foreign vocab) flips embeddings_available False — callers see
+        None and stay lexical. All state is instance-level, never module-global
+        (the loader execs this module under multiple names)."""
+        if not self.embeddings_available:
+            return None
+        if self._encoder is None:
+            try:
+                self._encoder = _MiniLMEncoder(self._embed_dir)
+            except Exception as e:
+                self._disable_embeddings(e)
+                return None
+        return self._encoder
+
+    def _query_vec(self, query: str):
+        """Embedding for a recall query, LRU-cached (cap 64) per instance.
+        Returns a normalized float32 vector, or None when embeddings are
+        unavailable or the encode fails (flag flips, lexical path continues).
+        NEVER call under self._lock — callers hoist it before locking so a
+        model run can never serialize writers."""
+        if not self.embeddings_available:
+            return None
+        if self._qvec_cache is None:
+            from collections import OrderedDict
+            self._qvec_cache = OrderedDict()
+        hit = self._qvec_cache.get(query)
+        if hit is not None:
+            self._qvec_cache.move_to_end(query)
+            return hit
+        enc = self._get_encoder()
+        if enc is None:
+            return None
+        try:
+            vec = enc.encode([query])[0]
+        except Exception as e:
+            self._disable_embeddings(e)
+            return None
+        self._qvec_cache[query] = vec
+        while len(self._qvec_cache) > 64:  # instance LRU cap (repeat queries hit)
+            self._qvec_cache.popitem(last=False)
+        return vec
+
+    def _sync_vectors(self, keys: list | None = None, dirty: bool = True) -> int:
+        """Bring mem_vec toward 'one current vector per live non-episode row'.
+        Returns the number of rows embedded THIS pass (callers drain with
+        `while mem._sync_vectors(): pass`); work per pass is capped at
+        EMBED_BACKFILL_BATCH so a first backfill never stalls one caller.
+
+        FAST PATH (dirty=False, i.e. an unchanged reindex): compare
+        COUNT(live non-episode mem) with COUNT(mem_vec WHERE encoder=current).
+        Sound because _upsert_locked/_delete_locked run their mem_vec
+        hash-delete UNCONDITIONALLY in every writer — a stale row cannot
+        exist, so equal counts mean no missing vectors under this encoder.
+
+        LOCK DISCIPLINE: candidate/orphan selection under a brief lock,
+        ENCODE WITH NO LOCK HELD (a model run must never serialize writers),
+        then one _with_write_retry closure containing ONLY sqlite ops. Each
+        row's content_hash is re-verified inside that closure — a row edited
+        mid-encode is skipped (its upsert already deleted the old vector;
+        the next pass heals it). Idempotent cross-process: INSERT OR REPLACE
+        keyed by dedupe_key, orphan DELETEs re-runnable."""
+        if not self.embeddings_available:
+            return 0
+        with self._lock:
+            if not dirty:
+                live = self._conn.execute(
+                    "SELECT COUNT(*) FROM mem"
+                    " WHERE kind != 'episode' AND invalid_at IS NULL").fetchone()[0]
+                have = self._conn.execute(
+                    "SELECT COUNT(*) FROM mem_vec WHERE encoder = ?",
+                    (ENCODER_ID,)).fetchone()[0]
+                if live == have:
+                    return 0
+            sql = ("SELECT m.dedupe_key, m.title, m.body, m.keywords FROM mem m"
+                   " LEFT JOIN mem_vec v ON v.dedupe_key = m.dedupe_key"
+                   " WHERE m.kind != 'episode' AND m.invalid_at IS NULL"
+                   " AND (v.dedupe_key IS NULL OR v.encoder != ?)")
+            args: list = [ENCODER_ID]
+            if keys is not None:
+                if not keys:
+                    return 0
+                sql += " AND m.dedupe_key IN (%s)" % ",".join("?" * len(keys))
+                args.extend(keys)
+            sql += " LIMIT ?"
+            args.append(EMBED_BACKFILL_BATCH)
+            todo = self._conn.execute(sql, args).fetchall()
+            # Orphans: vectors whose live non-episode mem row is gone
+            # (supersession leaves these; plain deletes already cleaned up).
+            orphans = [r[0] for r in self._conn.execute(
+                "SELECT v.dedupe_key FROM mem_vec v LEFT JOIN mem m"
+                " ON m.dedupe_key = v.dedupe_key"
+                " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                " WHERE m.dedupe_key IS NULL").fetchall()]
+        if not todo and not orphans:
+            return 0
+        vecs = None
+        if todo:
+            enc = self._get_encoder()
+            if enc is None:
+                return 0
+            try:
+                # Truncation policy (ENCODER_ID contract): title\nkeywords\nbody.
+                vecs = enc.encode(
+                    [f"{title}\n{kw}\n{body}" for _, title, body, kw in todo])
+            except Exception as e:
+                self._disable_embeddings(e)
+                return 0
+
+        def _write() -> int:
+            wrote = 0
+            with self._lock:
+                for okey in orphans:
+                    self._conn.execute(
+                        "DELETE FROM mem_vec WHERE dedupe_key=?", (okey,))
+                for i, (key, title, body, kw) in enumerate(todo):
+                    want = _vec_content_hash(title, body, kw)
+                    cur = self._conn.execute(
+                        "SELECT title, body, keywords FROM mem WHERE dedupe_key=?"
+                        " AND kind != 'episode' AND invalid_at IS NULL",
+                        (key,)).fetchone()
+                    if cur is None or _vec_content_hash(*cur) != want:
+                        continue  # changed/gone mid-encode: skip, next pass heals
+                    vec = vecs[i]
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO mem_vec"
+                        " (dedupe_key, content_hash, encoder, dim, vec)"
+                        " VALUES (?,?,?,?,?)",
+                        (key, want, ENCODER_ID, int(vec.shape[0]), vec.tobytes()))
+                    wrote += 1
+                self._conn.commit()
+            return wrote
+        return self._with_write_retry(_write)
 
     # -- retrieval -------------------------------------------------------------
     def _trust(self, stats_row) -> float:
@@ -915,9 +1321,17 @@ class Mneme:
         dfs.sort()  # ALL terms common: fall back to the KEEP_MIN rarest
         return [t for _df, t in dfs[:DF_PRUNE_KEEP_MIN]]
 
-    def _candidates(self, query: str, banks: tuple, limit: int = 64) -> list[dict]:
+    def _candidates(self, query: str, banks: tuple, limit: int = 64,
+                    *, qvec=None) -> list[dict]:
         """Lexical candidates: FTS5/BM25 (porter-stemmed) when available, else
-        LIKE token matching. Returns rows with a normalized lexical score."""
+        LIKE token matching. Returns rows with a normalized lexical score.
+
+        ADR-0004 UNION leg: when qvec (a normalized query vector, encoded by
+        the CALLER before taking self._lock) is given, existing candidates
+        gain a 'sem' cosine score and the top embed_top_n cosine-only rows are
+        appended with lex=0.0 — paraphrased queries recover notes BM25 cannot
+        nominate. With qvec=None this function is byte-identical to pre-ADR
+        (no 'sem' keys, cooc rescue intact) — the golden off-path pin holds."""
         toks = _tokens(query)
         if toks and self.fts_available:
             toks = self._prune_common_terms(toks)
@@ -938,10 +1352,13 @@ class Mneme:
         if toks and self.fts_available:
             match = " OR ".join(f'"{t}"' for t in toks)
             rows = self._conn.execute(_FTS_SQL, (match, *banks, limit)).fetchall()
-            if not rows:
+            if not rows and qvec is None:
                 # Empty-result rescue (bake-off verdict): co-occurrence expansion
                 # dilutes ranked results on the hot path, but when the strict
-                # query finds NOTHING a wider net can only help.
+                # query finds NOTHING a wider net can only help. Conditionally
+                # dead when embeddings are active (ADR-0004 settled): the union
+                # leg below is the stronger rescue, and stacking both would let
+                # cooc noise dilute the cosine-ranked additions.
                 wide = self._expand_tokens(toks)
                 if len(wide) > len(toks):
                     match = " OR ".join(f'"{t}"' for t in wide)
@@ -972,35 +1389,133 @@ class Mneme:
                 scored.append((*f, -float(hits)))  # negative = better, like bm25
             scored.sort(key=lambda x: (x[-1], x[0]))
             rows = scored[:limit]
-        if not rows:
+        if not rows and qvec is None:
             return []
-        # normalize lexical score to 0..1 (bm25 returns negative-better)
-        vals = [r[-1] for r in rows]
-        lo, hi = min(vals), max(vals)
-        span = (hi - lo) or 1.0
-        out = []
-        for r in rows:
-            out.append({"key": r[0], "kind": r[1], "bank": r[2], "title": r[3], "body": r[4],
-                        "keywords": r[5], "tags": r[6], "pinned": bool(r[7]), "valid_at": r[8],
-                        "credibility": r[9], "lex": (hi - r[-1]) / span})
+        out: list[dict] = []
+        if rows:
+            # normalize lexical score to 0..1 (bm25 returns negative-better)
+            vals = [r[-1] for r in rows]
+            lo, hi = min(vals), max(vals)
+            span = (hi - lo) or 1.0
+            for r in rows:
+                out.append({"key": r[0], "kind": r[1], "bank": r[2], "title": r[3], "body": r[4],
+                            "keywords": r[5], "tags": r[6], "pinned": bool(r[7]), "valid_at": r[8],
+                            "credibility": r[9], "lex": (hi - r[-1]) / span})
+        if qvec is not None:
+            # -- ADR-0004 union leg. Per-recall SQL scan over mem_vec with the
+            # SAME predicates as the FTS candidate query (bank, invalid_at,
+            # quarantined) — always fresh cross-process, NO cache, NO
+            # invalidation wiring (Promise 2: a stale vector must never
+            # nominate a quarantined row; here it structurally cannot).
+            # O(bank rows) matvec — comfortably inside the 20ms gate at the
+            # asserted 1k scale. Contingency if a measurement ever fails at
+            # 100k: per-bank matrix keyed by PRAGMA data_version, invalidated
+            # at the five _invalidate_cooc sites. Deliberately NOT built.
+            import numpy as np  # lazy: only the qvec path pays for it
+            qs_b = ",".join("?" * len(banks))
+            vrows = self._conn.execute(
+                "SELECT v.dedupe_key, v.vec FROM mem_vec v"
+                " JOIN mem m ON m.dedupe_key = v.dedupe_key"
+                " LEFT JOIN mem_stats s ON s.note_id = m.note_id"
+                f" WHERE v.encoder = ? AND m.bank IN ({qs_b})"
+                " AND m.invalid_at IS NULL AND COALESCE(s.quarantined, 0) = 0",
+                (ENCODER_ID, *banks)).fetchall()
+            if vrows:
+                mat = np.vstack([np.frombuffer(b, dtype="<f4") for _, b in vrows])
+                sims = mat @ qvec  # one matvec, never per-candidate encodes
+                simmap = {vrows[i][0]: float(sims[i]) for i in range(len(vrows))}
+                for c in out:
+                    sim = simmap.get(c["key"])
+                    if sim is not None:
+                        c["sem"] = sim  # raw cosine; normalized below
+                top_n = int(self.cfg["embed_top_n"])
+                if top_n > 0:
+                    # Cosine-only candidates BM25 could not nominate (the
+                    # zero-lexical-overlap class). embed_top_n=0 leaves pure
+                    # rerank-of-BM25 — the ADR's rejected variant, kept
+                    # expressible as a config row (gate 2's comparator).
+                    have = {c["key"] for c in out}
+                    extra = sorted(((s, k) for k, s in simmap.items()
+                                    if k not in have),
+                                   key=lambda x: (-x[0], x[1]))[:top_n]
+                    if extra:
+                        qs_k = ",".join("?" * len(extra))
+                        hyd = self._conn.execute(
+                            "SELECT dedupe_key, kind, bank, title, body,"
+                            " keywords, tags, pinned, valid_at, credibility"
+                            f" FROM mem WHERE dedupe_key IN ({qs_k})",
+                            [k for _, k in extra]).fetchall()
+                        hydmap = {h[0]: h for h in hyd}
+                        for sim, k in extra:
+                            h = hydmap.get(k)
+                            if h is None:
+                                continue  # deleted mid-recall: skip
+                            out.append({"key": h[0], "kind": h[1], "bank": h[2],
+                                        "title": h[3], "body": h[4],
+                                        "keywords": h[5], "tags": h[6],
+                                        "pinned": bool(h[7]), "valid_at": h[8],
+                                        "credibility": h[9], "lex": 0.0,
+                                        "sem": sim})
+            # Normalization: 'clip_abs' ships (cosine on L2-normalized MiniLM
+            # vectors is an absolute, comparable signal); per-set min-max is
+            # rejected by default because it inflates the best of a WEAK set
+            # to 1.0 — but it is MEASURED, not hand-asserted: the w_sem grid
+            # harness monkeypatches _SEM_NORM to compare both.
+            if _SEM_NORM == "minmax":
+                sems = [c["sem"] for c in out if "sem" in c]
+                if sems:
+                    s_lo, s_hi = min(sems), max(sems)
+                    s_span = (s_hi - s_lo) or 1.0
+                    for c in out:
+                        if "sem" in c:
+                            c["sem"] = (c["sem"] - s_lo) / s_span
+            else:
+                for c in out:
+                    if "sem" in c:
+                        c["sem"] = max(0.0, c["sem"])
         return out
 
-    def _weights(self) -> tuple[float, float]:
-        """(lexical, jaccard) blend for this store's retrieval mode."""
+    def _weights(self) -> tuple[float, float, float]:
+        """(lexical, jaccard, semantic) blend for this store's retrieval mode.
+        sem weight is forced to 0.0 whenever embeddings are unavailable —
+        together with 'sem' keys never being attached on the lexical path,
+        the off-path score is IEEE-exact identical to pre-ADR (adding
+        0.0*0.0 to a finite float is the identity)."""
+        sem_w = float(self.cfg["w_sem"]) if self.embeddings_available else 0.0
         if self.fts_available:
-            return LEX_WEIGHT, JAC_WEIGHT
-        return FALLBACK_LEX_WEIGHT, FALLBACK_JAC_WEIGHT
+            return LEX_WEIGHT, JAC_WEIGHT, sem_w
+        return FALLBACK_LEX_WEIGHT, FALLBACK_JAC_WEIGHT, sem_w
+
+    @staticmethod
+    def _score_parts(c: dict, weights: tuple, trust: float, jac: float,
+                     cred_w: float, decay: float) -> float:
+        """THE ranking formula, in exactly one place. retrieve() and
+        explain_recall() both call it, so what the operator is SHOWN can
+        never drift from what ranking DID (the retrieve-vs-explain equality
+        test is belt to this structural brace). 'sem' is absent from every
+        off-path candidate dict, so c.get('sem', 0.0) keeps the lexical
+        path arithmetically untouched."""
+        lex_w, jac_w, sem_w = weights
+        return (lex_w * c["lex"] + jac_w * jac + sem_w * c.get("sem", 0.0)) \
+            * trust * cred_w * decay
 
     def retrieve(self, query: str, repo: Path | None = None, limit: int = 64) -> list[dict]:
-        """Ranked memories: lexical(BM25) * trust * decay (Jaccard re-rank only
-        on the FTS-less fallback — see the weight constants for the evidence).
+        """Ranked memories: (lexical(BM25) + w_sem*cosine) * trust * decay
+        (Jaccard re-rank only on the FTS-less fallback — see the weight
+        constants for the evidence; the semantic term exists only when the
+        optional embeddings are active, see _weights/_score_parts).
         Quarantined and superseded rows never surface; unverified (repo-sourced,
         unpromoted) notes are down-weighted so they can't outrank trusted canon."""
         banks = ("global",) if repo is None else ("global", self.bank_of(repo))
+        # Query encode happens BEFORE the lock (never under it): a model run
+        # must never serialize writers. None whenever embeddings are off,
+        # unavailable, or the encode failed (flag flips, lexical continues).
+        qvec = self._query_vec(query) if self.embeddings_available else None
         with self._lock:
-            cands = self._candidates(query, banks, limit)
+            cands = self._candidates(query, banks, limit, qvec=qvec)
             stats = self._stats_map([c["key"] for c in cands])
-        lex_w, jac_w = self._weights()
+        weights = self._weights()
+        jac_w = weights[1]
         qgrams = _trigrams(query) if jac_w else set()
         out = []
         for c in cands:
@@ -1012,8 +1527,8 @@ class Mneme:
                 c["title"] + " " + c["keywords"] + " " + c["tags"])) if jac_w else 0.0
             cred_w = 1.0 if c.get("credibility", "operator") == "operator" else UNVERIFIED_WEIGHT
             c["trust"] = trust
-            c["score"] = (lex_w * c["lex"] + jac_w * jac) * trust * cred_w \
-                * self._decay(c["kind"], c["valid_at"])
+            c["score"] = self._score_parts(c, weights, trust, jac, cred_w,
+                                           self._decay(c["kind"], c["valid_at"]))
             out.append(c)
         # Credibility tier FIRST, score second: a down-weight alone cannot
         # guarantee 'unverified never outranks canon' when the lexical gap is
@@ -1522,11 +2037,25 @@ class Mneme:
                 "SELECT DISTINCT s.note_id, s.served, s.positive, s.negative FROM mem_stats s"
                 " JOIN mem m ON m.note_id = s.note_id"
                 " ORDER BY s.served DESC LIMIT 10").fetchall()
+            # ADR-0004 operator legibility: partial-backfill drift is visible,
+            # not silent — a host's stats dump shows exactly how much of the
+            # live store carries a current-encoder vector.
+            vectors = self._conn.execute(
+                "SELECT COUNT(*) FROM mem_vec WHERE encoder = ?",
+                (ENCODER_ID,)).fetchone()[0]
+            live_ne = self._conn.execute(
+                "SELECT COUNT(*) FROM mem"
+                " WHERE kind != 'episode' AND invalid_at IS NULL").fetchone()[0]
         return {"db": str(self.db_path), "fts": self.fts_available, "rows": total,
                 "by_kind": by_kind, "superseded": invalid, "ever_served": served,
                 "never_served": max(0, total - served), "quarantined": quarantined,
                 "most_served": [{"key": t[0], "served": t[1], "positive": t[2],
-                                 "negative": t[3]} for t in top]}
+                                 "negative": t[3]} for t in top],
+                "embeddings": {"available": self.embeddings_available,
+                               "encoder": ENCODER_ID,
+                               "vectors": vectors,
+                               "coverage": round(vectors / live_ne, 3) if live_ne else 0.0,
+                               "w_sem": float(self.cfg["w_sem"])}}
 
     # -- authoring -------------------------------------------------------------
     def add_note(self, kind: str, title: str, body: str = "", *, keywords: str = "",
@@ -1605,6 +2134,9 @@ class Mneme:
                                            sup_pinned=n.pinned, sup_cred=credibility)
                 self._conn.commit()
         self._with_write_retry(_do)
+        # ADR-0004: keep the O(1) programmatic write path vector-fresh too —
+        # scoped to THIS key, outside the write retry, encode never under lock.
+        self._sync_vectors(keys=[key])
 
     # === Unified agent-facing API =========================================
     # One layer, one interface. The verbs below are what an agent calls; the
@@ -1651,16 +2183,22 @@ class Mneme:
         return s
 
     def explain_recall(self, query, project=None, top_k=5):
-        """Every hit with its score COMPONENTS (lexical, jaccard, trust, decay)
-        so an operator can see WHY a memory ranked where it did."""
+        """Every hit with its score COMPONENTS (lexical, jaccard, semantic,
+        trust, decay) so an operator can see WHY a memory ranked where it did.
+        Scored by the SAME _score_parts helper retrieve() uses — the shown
+        components cannot drift from the ranking arithmetic. 'semantic'
+        appears ONLY when embeddings are active for this recall."""
         banks = ("global",) if project is None else ("global", self.bank_of(project))
         q = (query + " " + self._repo_hint(project)).strip()
+        # Same hoist as retrieve(): query encode never holds the lock.
+        qvec = self._query_vec(q) if self.embeddings_available else None
         with self._lock:
-            cands = self._candidates(q, banks, limit=max(32, top_k * 6))
+            cands = self._candidates(q, banks, limit=max(32, top_k * 6), qvec=qvec)
             stats = self._stats_map([c["key"] for c in cands])
         qg = _trigrams(q)
         out = []
-        lex_w, jac_w = self._weights()
+        weights = self._weights()
+        jac_w = weights[1]
         for c in cands:
             srow = stats.get(c["key"])
             if srow is not None and srow[4]:
@@ -1671,12 +2209,17 @@ class Mneme:
             decay = self._decay(c["kind"], c["valid_at"])
             cred = c.get("credibility", "operator")
             cred_w = 1.0 if cred == "operator" else UNVERIFIED_WEIGHT
-            out.append({"title": c["title"], "kind": c["kind"],
-                        "lexical": round(c["lex"], 3), "jaccard": round(jacc, 3),
-                        "trust": round(trust, 3), "decay": round(decay, 3),
-                        "credibility": cred,
-                        "score": round((lex_w * c["lex"] + jac_w * jacc)
-                                       * trust * cred_w * decay, 4)})
+            entry = {"title": c["title"], "kind": c["kind"],
+                     "lexical": round(c["lex"], 3), "jaccard": round(jacc, 3),
+                     "trust": round(trust, 3), "decay": round(decay, 3),
+                     "credibility": cred,
+                     "score": round(self._score_parts(
+                         c, weights, trust, jacc, cred_w, decay), 4)}
+            if qvec is not None:
+                # Conditional on the qvec path, mirroring 'sem' on candidate
+                # dicts: off-path explain output is field-identical to pre-ADR.
+                entry["semantic"] = round(c.get("sem", 0.0), 3)
+            out.append(entry)
         out.sort(key=lambda x: -x["score"])
         return out[:top_k]
 

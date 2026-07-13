@@ -5,5 +5,8 @@ models/
 mneme-data/
 demo/
 .pytest_cache/
+# uv-run scratch from the ADR-0004 test matrix (uv run --python 3.11/3.14 ...)
+.venv/
+uv.lock
 # local until the Phase 0 fixes it prescribes land (documents unpatched attack surface)
 DESIGN-REVIEW-2026-07-05.md
