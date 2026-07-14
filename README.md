@@ -79,7 +79,7 @@ your-agent/
 - **Identity**: every note has a stable id (frontmatter `id:`, or derived from
   its title) — rename or move a file, move the whole repo, sync across hosts:
   its trust and quarantine state follow it.
-- **Retrieval**: FTS5/BM25 (porter-stemmed) × trust × recency-decay (episodes
+- **Retrieval**: FTS5/BM25 plus optional semantic union/rerank × trust × recency-decay (episodes
   only), with df-aware query pruning (a query term matching >10% of the corpus
   is dropped — measured up to 100× faster recall at 100k rows, with equal-or-
   better precision). Lexical precision holds flat under distractor noise from
@@ -122,6 +122,8 @@ routed between. The agent-facing API:
 | `compact()` | archive episode overflow — never silent deletion |
 | `audit()` | store health: graveyard ratio, trust distribution |
 | `explain_recall(query)` | WHY each hit ranked: lexical/jaccard/trust/decay components |
+| `finalize_episode(run_id, goal, status, detail, project)` | replace an early checkpoint with a compact final summary |
+| `find_conflicts(project)` | report likely competing active notes; never mutates canon |
 
 `index_block(project, task_text, run_id)` remains the host-integration hook —
 the guaranteed read path injected at every task start.
@@ -142,7 +144,8 @@ prompt = f"{block.text}\n\n{task_prompt}"
 hits = mem.recall("flask blueprint 404", project_dir)
 
 # 3. close the loop with a PROVEN outcome ("done" | "rolled_back" | ...)
-mem.record_outcome(run_id, "done")            # served memories earn trust
+used = mem.served_keys(run_id, tier="recall")
+mem.record_outcome(run_id, "done", used_keys=used or None)
 #   record_outcome is idempotent per run_id — a retry/duplicate close is a no-op,
 #   and only mechanical results or an explicit operator verdict should call it.
 ```
@@ -156,7 +159,7 @@ drop a markdown file in the notes folder; the next reindex picks it up.
 python mneme.py --dir ./mneme-data add --title "..." [--kind lesson|fact|preference] [--body ...] [--keywords ...] [--pin] [--supersedes <slug>]
 python mneme.py --dir ./mneme-data recall "search terms"
 python mneme.py --dir ./mneme-data show ["query"]        # the exact block an agent would get
-python mneme.py --dir ./mneme-data stats | audit         # audit = graveyard ratio + trust distribution
+python mneme.py --dir ./mneme-data stats | audit | conflicts
 python mneme.py --dir ./mneme-data reindex | compact
 python mneme.py --dir ./mneme-data quarantine <slug> [--off]   # --off un-quarantines
 python mneme.py --dir ./mneme-data export [--out snapshot.md] | import snapshot.md
@@ -172,7 +175,7 @@ fallback engages automatically where it doesn't.)
 Paraphrase-robust recall via a local MiniLM ONNX encoder — opt-in, and the core stays zero-dependency.
 Provision the sha256-pinned model files (~23MB; the library itself never downloads anything): `scripts/provision_embeddings.ps1` (Windows) or `scripts/provision_embeddings.sh` (POSIX).
 Install the one optional wheel: `pip install "onnxruntime>=1.20"` (or `pip install "mneme-memory[embeddings]"`).
-With both present (`models/` next to the store's db, or the `embed_model_dir` config key), embeddings activate automatically; remove either and Mneme degrades silently to lexical-only.
+With both present (`models/` next to the store's db, or the `embed_model_dir` config key), embeddings activate automatically. A missing/broken encoder still degrades non-fatally to lexical-only, but `stats()["embeddings"]` now exposes the configured state, model directory, coverage, and exact error. Episodes are vectorized too; their existing time decay still controls final ranking.
 
 ## Provenance
 

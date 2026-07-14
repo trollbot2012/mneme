@@ -23,7 +23,7 @@ research provenance: see PRD.md. Extracted unchanged — Ktisis runs this code.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import hashlib
 import re
@@ -179,6 +179,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -240,6 +241,11 @@ CREATE TABLE IF NOT EXISTS run_outcome (
     run_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS maintenance_event (
+    name TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
 );
 -- ADR-0004: vector mirror of live notes, keyed by dedupe_key exactly like
 -- mem_fts. A PLAIN table inside _SCHEMA (not _FTS_SCHEMA's try/except): the
@@ -597,9 +603,15 @@ class Mneme:
         self._qvec_cache = None   # query-vec LRU (OrderedDict), built lazily
         self._embed_dir = (Path(cfg["embed_model_dir"]) if cfg["embed_model_dir"]
                            else self.db_path.parent / "models")
-        self.embeddings_available = (
+        self.embeddings_configured = (
             str(cfg["embeddings"]).lower() != "off"
             and all((self._embed_dir / f).is_file() for f in EMBED_MODEL_FILES))
+        self.embeddings_available = self.embeddings_configured
+        self.embedding_error = ""
+        if str(cfg["embeddings"]).lower() != "off" and not self.embeddings_configured:
+            missing = [f for f in EMBED_MODEL_FILES
+                       if not (self._embed_dir / f).is_file()]
+            self.embedding_error = "missing model files: " + ", ".join(missing)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         # RLock: _with_write_retry holds it across attempt AND rollback so a
@@ -1027,7 +1039,10 @@ class Mneme:
         THE SAME BANK (audit C1). Supersession needs AUTHORITY (design review):
         an unverified repo note can never invalidate operator canon, and only
         a pinned note may supersede a pinned one."""
-        slug = slugify(target) or target.lower()
+        targets = [part.strip() for part in str(target).split(",") if part.strip()]
+        slugs = {slugify(part) or part.lower() for part in targets}
+        if not slugs:
+            return
         now = time.time()
         rows = self._conn.execute(
             "SELECT dedupe_key, title, pinned, credibility FROM mem WHERE invalid_at IS NULL"
@@ -1035,7 +1050,7 @@ class Mneme:
             (bank, new_key)).fetchall()
         for key, title, tgt_pinned, tgt_cred in rows:
             stem = key.rsplit("/", 1)[-1].removesuffix(".md")
-            if stem != slug and slugify(title) != slug:
+            if stem not in slugs and slugify(title) not in slugs:
                 continue
             if tgt_cred == "operator" and sup_cred != "operator":
                 continue  # no authority: unverified cannot displace canon
@@ -1077,10 +1092,58 @@ class Mneme:
                     (self.bank_of(repo),)).fetchone()[0]
 
         episode_count = self._with_write_retry(_do)
+        # Episodes are part of semantic continuity too. Keeping them lexical-
+        # only made paraphrased questions about past sessions impossible even
+        # when the encoder was healthy. The vector remains a disposable cache.
+        if episode_count != -1:
+            self._sync_vectors(keys=[key])
         # Outside the lock (compact re-acquires it): amortized self-maintenance.
         if (episode_count > 0 and self.cfg.get("auto_compact", True)
                 and episode_count > int(self.cfg["max_episodes"]) + AUTO_COMPACT_SLACK):
             self.compact()
+
+    def finalize_episode(self, run_id: str, goal: str, status: str, detail: str,
+                         repo: Path | None) -> bool:
+        """Finalize a first-turn checkpoint with the session's real summary.
+
+        ``add_episode`` is deliberately first-write-wins for idempotency. Hosts
+        that checkpoint early therefore need an explicit finalization verb;
+        calling ``add_episode`` again silently preserved the thin checkpoint
+        forever. This update is scoped to the same run id, refreshes FTS and
+        invalidates/rebuilds the derived vector atomically enough for readers.
+        """
+        key = "run:" + run_id
+        title = f"[{status}] {goal[:140]}"
+        body = detail[:2000]
+        bank = self.bank_of(repo)
+
+        def _do() -> bool:
+            with self._lock:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM mem WHERE dedupe_key=?", (key,)).fetchone()
+                if not exists:
+                    return False
+                self._conn.execute(
+                    "UPDATE mem SET bank=?, title=?, body=?, tags=?, valid_at=?"
+                    " WHERE dedupe_key=? AND kind='episode'",
+                    (bank, title, body, status, time.time(), key))
+                if self.fts_available:
+                    self._conn.execute("DELETE FROM mem_fts WHERE dedupe_key=?", (key,))
+                    self._conn.execute(
+                        "INSERT INTO mem_fts (dedupe_key,title,body,keywords,tags)"
+                        " VALUES (?,?,?,?,?)", (key, title, body, "", status))
+                # Never-stale invariant: a reader may see no vector, never the
+                # checkpoint's vector attached to finalized text.
+                self._conn.execute("DELETE FROM mem_vec WHERE dedupe_key=?", (key,))
+                self._conn.commit()
+                return True
+
+        updated = self._with_write_retry(_do)
+        if not updated:
+            self.add_episode(run_id, goal, status, detail, repo)
+            return True
+        self._sync_vectors(keys=[key])
+        return True
 
     # -- ADR-0004: optional embeddings ----------------------------------------
     def _disable_embeddings(self, why) -> None:
@@ -1090,6 +1153,7 @@ class Mneme:
         if not self.embeddings_available:
             return
         self.embeddings_available = False
+        self.embedding_error = str(why)
         try:
             import logging
             logging.getLogger("mneme").warning(
@@ -1141,14 +1205,14 @@ class Mneme:
         return vec
 
     def _sync_vectors(self, keys: list | None = None, dirty: bool = True) -> int:
-        """Bring mem_vec toward 'one current vector per live non-episode row'.
+        """Bring mem_vec toward 'one current vector per live row'.
         Returns the number of rows embedded THIS pass (callers drain with
         `while mem._sync_vectors(): pass`); work per pass is capped at
         EMBED_BACKFILL_BATCH so a first backfill never stalls one caller.
 
         FAST PATH (dirty=False, i.e. an unchanged reindex): compare
-        COUNT(live non-episode mem) with COUNT(mem_vec joined to a live
-        non-episode row, encoder=current). The join is load-bearing: a raw
+        COUNT(live mem) with COUNT(mem_vec joined to a live row,
+        encoder=current). The join is load-bearing: a raw
         mem_vec count would let an ORPHAN vector (supersession leaves one
         until the next sweep) mask a live row that is missing its vector —
         equal totals, permanent coverage hole (adversarial-verify finding,
@@ -1168,19 +1232,18 @@ class Mneme:
         with self._lock:
             if not dirty:
                 live = self._conn.execute(
-                    "SELECT COUNT(*) FROM mem"
-                    " WHERE kind != 'episode' AND invalid_at IS NULL").fetchone()[0]
+                    "SELECT COUNT(*) FROM mem WHERE invalid_at IS NULL").fetchone()[0]
                 have = self._conn.execute(
                     "SELECT COUNT(*) FROM mem_vec v JOIN mem m"
                     " ON m.dedupe_key = v.dedupe_key"
-                    " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                    " AND m.invalid_at IS NULL"
                     " WHERE v.encoder = ?",
                     (ENCODER_ID,)).fetchone()[0]
                 if live == have:
                     return 0
             sql = ("SELECT m.dedupe_key, m.title, m.body, m.keywords FROM mem m"
                    " LEFT JOIN mem_vec v ON v.dedupe_key = m.dedupe_key"
-                   " WHERE m.kind != 'episode' AND m.invalid_at IS NULL"
+                   " WHERE m.invalid_at IS NULL"
                    " AND (v.dedupe_key IS NULL OR v.encoder != ?)")
             args: list = [ENCODER_ID]
             if keys is not None:
@@ -1191,12 +1254,12 @@ class Mneme:
             sql += " LIMIT ?"
             args.append(EMBED_BACKFILL_BATCH)
             todo = self._conn.execute(sql, args).fetchall()
-            # Orphans: vectors whose live non-episode mem row is gone
+            # Orphans: vectors whose live mem row is gone
             # (supersession leaves these; plain deletes already cleaned up).
             orphans = [r[0] for r in self._conn.execute(
                 "SELECT v.dedupe_key FROM mem_vec v LEFT JOIN mem m"
                 " ON m.dedupe_key = v.dedupe_key"
-                " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                " AND m.invalid_at IS NULL"
                 " WHERE m.dedupe_key IS NULL").fetchall()]
         if not todo and not orphans:
             return 0
@@ -1223,7 +1286,7 @@ class Mneme:
                     want = _vec_content_hash(title, body, kw)
                     cur = self._conn.execute(
                         "SELECT title, body, keywords FROM mem WHERE dedupe_key=?"
-                        " AND kind != 'episode' AND invalid_at IS NULL",
+                        " AND invalid_at IS NULL",
                         (key,)).fetchone()
                     if cur is None or _vec_content_hash(*cur) != want:
                         continue  # changed/gone mid-encode: skip, next pass heals
@@ -1849,6 +1912,71 @@ class Mneme:
                 return len(touched)
         return self._with_write_retry(_do)
 
+    def repair_weak_bystander_trust(self) -> dict:
+        """One-time repair for legacy failed runs that had no usage evidence.
+
+        Older Hermes wiring called ``apply_outcome(..., rolled_back)`` without
+        ``used_keys``. The engine intentionally assigned every served note a
+        0.1 weak debit, but that signal was not trustworthy for chat/job runs.
+        Reconstruct those exact contributions from the evidence tables and
+        subtract only them. Full-point used-memory evidence and unrelated
+        legacy counters remain untouched. A maintenance ledger makes this
+        operation idempotent.
+        """
+        event_name = "repair:no-use-negative-v1"
+
+        def _do() -> dict:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if self._conn.execute(
+                        "SELECT 1 FROM maintenance_event WHERE name=?",
+                        (event_name,)).fetchone():
+                    self._conn.rollback()
+                    return {"already_applied": True, "runs": 0, "notes": 0,
+                            "negative_points_removed": 0.0}
+                run_rows = self._conn.execute(
+                    "SELECT o.run_id FROM run_outcome o"
+                    " WHERE o.status IN ('rolled_back','failed_verification')"
+                    " AND NOT EXISTS (SELECT 1 FROM mem_served u"
+                    " WHERE u.run_id=o.run_id AND u.used=1)").fetchall()
+                run_ids = [r[0] for r in run_rows]
+                contributions: dict[str, int] = {}
+                if run_ids:
+                    qs = ",".join("?" * len(run_ids))
+                    for nid, count in self._conn.execute(
+                            "SELECT s.note_id, COUNT(DISTINCT s.run_id)"
+                            " FROM mem_served s JOIN mem m ON m.note_id=s.note_id"
+                            " LEFT JOIN mem_stats st ON st.note_id=s.note_id"
+                            f" WHERE s.run_id IN ({qs}) AND s.note_id != ''"
+                            " AND m.credibility='operator' AND m.pinned=0"
+                            " AND COALESCE(st.quarantined,0)=0"
+                            " GROUP BY s.note_id", run_ids).fetchall():
+                        contributions[nid] = int(count)
+                touched = []
+                removed = 0.0
+                for nid, count in contributions.items():
+                    row = self._conn.execute(
+                        "SELECT negative FROM mem_stats WHERE note_id=?", (nid,)).fetchone()
+                    if row is None or row[0] <= 0:
+                        continue
+                    amount = min(float(row[0]), count * SERVED_UNUSED_NEG)
+                    self._conn.execute(
+                        "UPDATE mem_stats SET negative=MAX(0, negative-?) WHERE note_id=?",
+                        (amount, nid))
+                    removed += amount
+                    touched.append(nid)
+                self._append_trust_sidecar_locked(touched)
+                detail = json.dumps({"runs": len(run_ids), "notes": len(touched),
+                                     "negative_points_removed": round(removed, 6)})
+                self._conn.execute(
+                    "INSERT INTO maintenance_event(name,ts,detail) VALUES (?,?,?)",
+                    (event_name, time.time(), detail))
+                self._conn.commit()
+                return {"already_applied": False, "runs": len(run_ids),
+                        "notes": len(touched),
+                        "negative_points_removed": round(removed, 6)}
+        return self._with_write_retry(_do)
+
     def _resolve_rows(self, key_or_slug: str) -> list[tuple]:
         """(dedupe_key, note_id) for an exact key, a note_id, a filename stem,
         or a TITLE slug (what the operator actually sees in the index block —
@@ -2057,22 +2185,85 @@ class Mneme:
             vectors = self._conn.execute(
                 "SELECT COUNT(*) FROM mem_vec v JOIN mem m"
                 " ON m.dedupe_key = v.dedupe_key"
-                " AND m.kind != 'episode' AND m.invalid_at IS NULL"
+                " AND m.invalid_at IS NULL"
                 " WHERE v.encoder = ?",
                 (ENCODER_ID,)).fetchone()[0]
-            live_ne = self._conn.execute(
-                "SELECT COUNT(*) FROM mem"
-                " WHERE kind != 'episode' AND invalid_at IS NULL").fetchone()[0]
+            live_rows = self._conn.execute(
+                "SELECT COUNT(*) FROM mem WHERE invalid_at IS NULL").fetchone()[0]
+            outcomes = dict(self._conn.execute(
+                "SELECT status, COUNT(*) FROM run_outcome GROUP BY status").fetchall())
+            trust_rows = self._conn.execute(
+                "SELECT COALESCE(s.positive,0), COALESCE(s.negative,0) FROM mem m"
+                " LEFT JOIN mem_stats s ON s.note_id=m.note_id"
+                " WHERE m.invalid_at IS NULL AND m.kind != 'episode'").fetchall()
+        trust_values = [(p + 1) / (p + n + 2) for p, n in trust_rows if p or n]
+        trust_health = {
+            "evaluated": len(trust_values),
+            "unevaluated": len(trust_rows) - len(trust_values),
+            "mean": round(sum(trust_values) / len(trust_values), 3)
+                    if trust_values else None,
+        }
+        conflict_count = len(self.find_conflicts(limit=1000))
         return {"db": str(self.db_path), "fts": self.fts_available, "rows": total,
                 "by_kind": by_kind, "superseded": invalid, "ever_served": served,
                 "never_served": max(0, total - served), "quarantined": quarantined,
                 "most_served": [{"key": t[0], "served": t[1], "positive": t[2],
                                  "negative": t[3]} for t in top],
                 "embeddings": {"available": self.embeddings_available,
+                               "configured": self.embeddings_configured,
+                               "error": self.embedding_error,
+                               "model_dir": str(self._embed_dir),
                                "encoder": ENCODER_ID,
                                "vectors": vectors,
-                               "coverage": round(vectors / live_ne, 3) if live_ne else 0.0,
-                               "w_sem": float(self.cfg["w_sem"])}}
+                               "coverage": round(vectors / live_rows, 3) if live_rows else 0.0,
+                               "w_sem": float(self.cfg["w_sem"])},
+                "evidence": {"outcomes": outcomes, "trust": trust_health},
+                "conflicts": {"candidates": conflict_count}}
+
+    def find_conflicts(self, repo: Path | None = None, *,
+                       min_similarity: float = 0.72, limit: int = 50) -> list[dict]:
+        """Report likely competing active notes without mutating canon.
+
+        Supersession remains an explicit operator/author decision. This method
+        makes the missing decision visible by comparing titles only within the
+        same bank and kind. It is intentionally conservative and auditable.
+        """
+        banks = ["global"]
+        if repo is not None:
+            banks.append(self.bank_of(repo))
+        qs = ",".join("?" * len(banks))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT dedupe_key, kind, bank, title FROM mem"
+                f" WHERE invalid_at IS NULL AND kind != 'episode' AND bank IN ({qs})"
+                " ORDER BY bank, kind, title", banks).fetchall()
+        groups: dict[tuple[str, str], list[tuple]] = {}
+        for row in rows:
+            groups.setdefault((row[2], row[1]), []).append(row)
+        found = []
+        for (_bank, _kind), items in groups.items():
+            for i, left in enumerate(items):
+                lslug = slugify(left[3])
+                ltokens = set(lslug.split("-"))
+                for right in items[i + 1:]:
+                    rslug = slugify(right[3])
+                    rtokens = set(rslug.split("-"))
+                    token_score = (_jaccard(ltokens, rtokens)
+                                   if ltokens and rtokens else 0.0)
+                    sequence_score = SequenceMatcher(None, lslug, rslug).ratio()
+                    similarity = max(token_score, sequence_score)
+                    if similarity < min_similarity:
+                        continue
+                    found.append({
+                        "similarity": round(similarity, 3),
+                        "left": {"key": left[0], "kind": left[1],
+                                 "bank": left[2], "title": left[3]},
+                        "right": {"key": right[0], "kind": right[1],
+                                  "bank": right[2], "title": right[3]},
+                    })
+        found.sort(key=lambda p: (-p["similarity"],
+                                  p["left"]["title"], p["right"]["title"]))
+        return found[:max(0, int(limit))]
 
     # -- authoring -------------------------------------------------------------
     def add_note(self, kind: str, title: str, body: str = "", *, keywords: str = "",
@@ -2395,6 +2586,7 @@ def _cli() -> int:
     p_rec = sub.add_parser("recall"); p_rec.add_argument("query")
     p_show = sub.add_parser("show"); p_show.add_argument("query", nargs="?", default="")
     sub.add_parser("stats"); sub.add_parser("audit")
+    sub.add_parser("conflicts", help="report likely competing active notes")
     sub.add_parser("reindex"); sub.add_parser("compact")
     p_q = sub.add_parser("quarantine"); p_q.add_argument("slug"); p_q.add_argument("--off", action="store_true")
     p_pro = sub.add_parser("promote", help="trust a repo-suggested note (content-hash pinned)")
@@ -2423,6 +2615,8 @@ def _cli() -> int:
         print(_json.dumps(mem.stats(), indent=2))
     elif args.cmd == "audit":
         print(_json.dumps(mem.audit(), indent=2))
+    elif args.cmd == "conflicts":
+        print(_json.dumps(mem.find_conflicts(project), indent=2))
     elif args.cmd == "reindex":
         print(_json.dumps(mem.reindex(project, force=True)))
     elif args.cmd == "compact":
