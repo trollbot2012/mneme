@@ -12,6 +12,18 @@ every serve is metered, and one command proves the whole loop end to end.
 pip? no. server? no. embeddings? no. just:  python mneme.py --dir ./m add --title "..."
 ```
 
+## Hermes production layout
+
+The engine stays one file. Hermes host policy lives under `host/hermes/` and is
+deployed into a profile with:
+
+```powershell
+python scripts/sync_hermes_bundle.py --profile $env:LOCALAPPDATA/hermes/profiles/aletheon
+python scripts/verify_hermes_bundle.py --profile $env:LOCALAPPDATA/hermes/profiles/aletheon
+```
+
+See [docs/LAYOUT.md](docs/LAYOUT.md) and [docs/ADR-0006-episode-quality-and-host-layout.md](docs/ADR-0006-episode-quality-and-host-layout.md).
+
 ## Install (one command)
 
 macOS / Linux / Git Bash:

@@ -1,0 +1,3 @@
+name: mneme
+version: "0.1.0"
+description: "File-canon memory with proof-coupled trust. Markdown notes (operator-owned) + disposable SQLite FTS5 index. Per-project banks."

@@ -102,6 +102,48 @@ def test_stats_exposes_outcome_and_trust_health(tmp_path):
     assert health["trust"]["unevaluated"] == 0
 
 
+def test_finalize_is_monotonic_on_richness(tmp_path):
+    mem = make_store(tmp_path)
+    mem.add_episode("run-m", "ship cobalt", "session_open",
+                    "Checkpointed at first serve: x on cli", None)
+    rich = (
+        "Session: s1\nPlatform: cli\nTurns: 2\n"
+        "User development: ship cobalt to staging\n"
+        "Final response/result: deployed and verified green"
+    )
+    mem.finalize_episode("run-m", "ship cobalt", "session_progress", rich, None)
+    mem.finalize_episode(
+        "run-m", "ship cobalt", "session_end",
+        "Session s1 on cli, 0 turns", None,
+    )
+    with sqlite3.connect(mem.db_path) as conn:
+        body, tags = conn.execute(
+            "SELECT body, tags FROM mem WHERE dedupe_key='run:run-m'"
+        ).fetchone()
+    assert "deployed and verified green" in body
+    assert tags == "session_end"
+
+
+def test_thin_checkpoint_episodes_are_demoted_in_recall(tmp_path):
+    mem = make_store(tmp_path)
+    mem.add_episode(
+        "thin", "cobalt deploy", "session_open",
+        "Checkpointed at first serve: thin on cli", None,
+    )
+    mem.add_episode(
+        "rich", "cobalt deploy", "session_end",
+        "Session: r\nPlatform: cli\nTurns: 3\n"
+        "User development: fix cobalt deploy auth\n"
+        "Final response/result: cobalt deploy auth fixed and verified",
+        None,
+    )
+    hits = mem.recall("cobalt deploy auth verification", top_k=5)
+    assert hits
+    assert hits[0]["key"] == "run:rich"
+    assert mem.stats()["episodes"]["thin"] >= 1
+    assert mem.stats()["episodes"]["rich"] >= 1
+
+
 def test_repair_removes_only_legacy_no_use_failure_debits(tmp_path):
     mem = make_store(tmp_path)
     mem.add_note("lesson", "Alpha guidance", "Verify alpha before acting.")

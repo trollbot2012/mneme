@@ -138,7 +138,10 @@ def scan_notes(root: Path) -> list[Note]:
 
 
 def slugify(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60]
+    # rstrip AFTER truncation too: cutting at 60 chars can land on a "-",
+    # producing a slug no supersedes= target can ever match (slugify of the
+    # target strips it, slugify of the stored title kept it).
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60].rstrip("-")
 
 
 def _derived_note_id(bank: str, kind: str, title: str) -> str:
@@ -1102,47 +1105,104 @@ class Mneme:
                 and episode_count > int(self.cfg["max_episodes"]) + AUTO_COMPACT_SLACK):
             self.compact()
 
+    @staticmethod
+    def episode_richness(body: str, status: str = "") -> int:
+        """Ordinal quality of an episode body for monotonic upgrade decisions.
+
+        Progressive hosts may call finalize many times; a later empty/thin
+        close must never erase a richer mid-session summary.
+        """
+        text = (body or "").strip()
+        status = (status or "").strip().lower()
+        score = len(text)
+        if text.startswith("Checkpointed at first serve"):
+            score = min(score, 40)
+        if "User development:" in text:
+            score += 250
+        if "Final response/result:" in text:
+            score += 250
+        if "Project:" in text:
+            score += 40
+        if status in ("session_end", "session_reset", "session_segment"):
+            score += 120
+        elif status in ("session_progress",):
+            score += 60
+        elif status in ("session_open",):
+            score += 0
+        return score
+
+    @staticmethod
+    def episode_quality_weight(body: str, tags: str = "") -> float:
+        """Retrieval multiplier for thin/checkpoint episodes (0.15–1.0).
+
+        Historical unclean exits left hundreds of checkpoint stubs. They stay
+        for auditability but must not outrank structured session summaries.
+        """
+        text = (body or "").strip()
+        tags = (tags or "").strip().lower()
+        if text.startswith("Checkpointed at first serve"):
+            return 0.15
+        if len(text) < 80:
+            return 0.25
+        if "User development:" in text or "Final response/result:" in text:
+            return 1.0
+        if tags in ("session_end", "session_reset", "session_segment",
+                    "session_progress") and len(text) >= 120:
+            return 0.85
+        return 0.45
+
     def finalize_episode(self, run_id: str, goal: str, status: str, detail: str,
                          repo: Path | None) -> bool:
-        """Finalize a first-turn checkpoint with the session's real summary.
+        """Upgrade a first-turn checkpoint with a richer session summary.
 
         ``add_episode`` is deliberately first-write-wins for idempotency. Hosts
         that checkpoint early therefore need an explicit finalization verb;
         calling ``add_episode`` again silently preserved the thin checkpoint
-        forever. This update is scoped to the same run id, refreshes FTS and
-        invalidates/rebuilds the derived vector atomically enough for readers.
+        forever. Updates are **monotonic on richness**: a thin/empty close
+        cannot overwrite a progressive mid-session body. FTS and vectors are
+        refreshed only when the body actually changes.
         """
         key = "run:" + run_id
         title = f"[{status}] {goal[:140]}"
-        body = detail[:2000]
+        body = (detail or "")[:2000]
         bank = self.bank_of(repo)
+        new_rich = self.episode_richness(body, status)
 
-        def _do() -> bool:
+        def _do() -> str:
             with self._lock:
-                exists = self._conn.execute(
-                    "SELECT 1 FROM mem WHERE dedupe_key=?", (key,)).fetchone()
-                if not exists:
-                    return False
+                row = self._conn.execute(
+                    "SELECT body, tags FROM mem WHERE dedupe_key=? AND kind='episode'",
+                    (key,)).fetchone()
+                if not row:
+                    return "missing"
+                old_body, old_tags = row[0] or "", row[1] or ""
+                keep_body = body
+                if self.episode_richness(old_body, old_tags) > new_rich:
+                    # Preserve richer progressive detail; still allow status
+                    # promotion on the title/tags for lifecycle visibility.
+                    keep_body = old_body
                 self._conn.execute(
                     "UPDATE mem SET bank=?, title=?, body=?, tags=?, valid_at=?"
                     " WHERE dedupe_key=? AND kind='episode'",
-                    (bank, title, body, status, time.time(), key))
+                    (bank, title, keep_body, status, time.time(), key))
                 if self.fts_available:
                     self._conn.execute("DELETE FROM mem_fts WHERE dedupe_key=?", (key,))
                     self._conn.execute(
                         "INSERT INTO mem_fts (dedupe_key,title,body,keywords,tags)"
-                        " VALUES (?,?,?,?,?)", (key, title, body, "", status))
+                        " VALUES (?,?,?,?,?)", (key, title, keep_body, "", status))
                 # Never-stale invariant: a reader may see no vector, never the
-                # checkpoint's vector attached to finalized text.
-                self._conn.execute("DELETE FROM mem_vec WHERE dedupe_key=?", (key,))
+                # previous vector attached to new text.
+                if keep_body != old_body:
+                    self._conn.execute("DELETE FROM mem_vec WHERE dedupe_key=?", (key,))
                 self._conn.commit()
-                return True
+                return "updated" if keep_body != old_body else "status_only"
 
-        updated = self._with_write_retry(_do)
-        if not updated:
+        result = self._with_write_retry(_do)
+        if result == "missing":
             self.add_episode(run_id, goal, status, detail, repo)
             return True
-        self._sync_vectors(keys=[key])
+        if result == "updated":
+            self._sync_vectors(keys=[key])
         return True
 
     # -- ADR-0004: optional embeddings ----------------------------------------
@@ -1601,9 +1661,12 @@ class Mneme:
             jac = _jaccard(qgrams, _trigrams(
                 c["title"] + " " + c["keywords"] + " " + c["tags"])) if jac_w else 0.0
             cred_w = 1.0 if c.get("credibility", "operator") == "operator" else UNVERIFIED_WEIGHT
+            decay = self._decay(c["kind"], c["valid_at"])
+            if c["kind"] == "episode":
+                decay *= self.episode_quality_weight(c.get("body") or "",
+                                                     c.get("tags") or "")
             c["trust"] = trust
-            c["score"] = self._score_parts(c, weights, trust, jac, cred_w,
-                                           self._decay(c["kind"], c["valid_at"]))
+            c["score"] = self._score_parts(c, weights, trust, jac, cred_w, decay)
             out.append(c)
         # Credibility tier FIRST, score second: a down-weight alone cannot
         # guarantee 'unverified never outranks canon' when the lexical gap is
@@ -2102,12 +2165,19 @@ class Mneme:
                 "SELECT dedupe_key FROM mem WHERE invalid_at IS NOT NULL AND invalid_at < ?",
                 (cutoff,)).fetchall()]
             doomed_set = set(doomed)
+            # Prefer archiving thin checkpoint stubs before rich summaries when
+            # a bank overflows (ADR-0006 episode quality).
             episodes = self._conn.execute(
-                "SELECT m.dedupe_key, m.bank, COALESCE(s.served, 0) FROM mem m"
+                "SELECT m.dedupe_key, m.bank, COALESCE(s.served, 0), m.body, m.tags"
+                " FROM mem m"
                 " LEFT JOIN mem_stats s ON s.note_id = m.note_id"
-                " WHERE m.kind='episode' ORDER BY COALESCE(s.served,0) ASC, m.valid_at ASC").fetchall()
+                " WHERE m.kind='episode'"
+                " ORDER BY COALESCE(s.served,0) ASC,"
+                " CASE WHEN m.body LIKE 'Checkpointed at first serve%'"
+                "      OR length(m.body) < 80 THEN 0 ELSE 1 END ASC,"
+                " m.valid_at ASC").fetchall()
             by_bank: dict = defaultdict(list)
-            for key, bank, _served in episodes:
+            for key, bank, _served, _body, _tags in episodes:
                 by_bank[bank].append(key)
             for bank, keys_in_bank in by_bank.items():
                 overflow = len(keys_in_bank) - cap
@@ -2196,12 +2266,54 @@ class Mneme:
                 "SELECT COALESCE(s.positive,0), COALESCE(s.negative,0) FROM mem m"
                 " LEFT JOIN mem_stats s ON s.note_id=m.note_id"
                 " WHERE m.invalid_at IS NULL AND m.kind != 'episode'").fetchall()
+            ep_rows = self._conn.execute(
+                "SELECT body, tags, bank FROM mem"
+                " WHERE invalid_at IS NULL AND kind='episode'").fetchall()
+            bank_note_rows = self._conn.execute(
+                "SELECT bank, COUNT(*) FROM mem"
+                " WHERE invalid_at IS NULL AND kind != 'episode'"
+                " GROUP BY bank").fetchall()
         trust_values = [(p + 1) / (p + n + 2) for p, n in trust_rows if p or n]
         trust_health = {
             "evaluated": len(trust_values),
             "unevaluated": len(trust_rows) - len(trust_values),
             "mean": round(sum(trust_values) / len(trust_values), 3)
                     if trust_values else None,
+        }
+        thin = rich = finalized = open_ck = 0
+        body_lens: list[int] = []
+        for body, tags, _bank in ep_rows:
+            text = body or ""
+            body_lens.append(len(text))
+            tags_l = (tags or "").lower()
+            if tags_l in ("session_end", "session_reset", "session_segment"):
+                finalized += 1
+            if tags_l in ("session_open",) or text.startswith(
+                    "Checkpointed at first serve"):
+                open_ck += 1
+            q = self.episode_quality_weight(text, tags or "")
+            if q <= 0.25:
+                thin += 1
+            if q >= 0.85:
+                rich += 1
+        n_ep = len(ep_rows)
+        episode_health = {
+            "total": n_ep,
+            "thin": thin,
+            "rich": rich,
+            "finalized": finalized,
+            "open_or_checkpoint": open_ck,
+            "thin_ratio": round(thin / n_ep, 3) if n_ep else 0.0,
+            "rich_ratio": round(rich / n_ep, 3) if n_ep else 0.0,
+            "mean_body_len": round(sum(body_lens) / n_ep, 1) if n_ep else 0.0,
+        }
+        project_notes = sum(c for b, c in bank_note_rows if b and b != "global")
+        global_notes = sum(c for b, c in bank_note_rows if b == "global")
+        banks_health = {
+            "global_notes": global_notes,
+            "project_notes": project_notes,
+            "project_banks": sum(1 for b, _c in bank_note_rows
+                                 if b and b != "global"),
         }
         conflict_count = len(self.find_conflicts(limit=1000))
         return {"db": str(self.db_path), "fts": self.fts_available, "rows": total,
@@ -2218,6 +2330,8 @@ class Mneme:
                                "coverage": round(vectors / live_rows, 3) if live_rows else 0.0,
                                "w_sem": float(self.cfg["w_sem"])},
                 "evidence": {"outcomes": outcomes, "trust": trust_health},
+                "episodes": episode_health,
+                "banks": banks_health,
                 "conflicts": {"candidates": conflict_count}}
 
     def find_conflicts(self, repo: Path | None = None, *,
